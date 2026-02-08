@@ -67,6 +67,7 @@ public class RadioManager {
     private volatile CountDownLatch versionLatch;
     private volatile CountDownLatch channelLatch;
     private volatile CountDownLatch transferLatch;
+    private volatile CountDownLatch launchLatch;
     private volatile CountDownLatch volumeLatch;
     private volatile CountDownLatch micLatch;
     private volatile CountDownLatch spkLatch;
@@ -74,6 +75,7 @@ public class RadioManager {
     private volatile int lastVersionStatus = -1;
     private volatile int lastChannelStatus = -1;
     private volatile int lastTransferStatus = -1;
+    private volatile int lastLaunchStatus = -1;
     private volatile int lastVolumeStatus = -1;
     private volatile int lastMicStatus = -1;
     private volatile int lastSpkStatus = -1;
@@ -247,6 +249,8 @@ public class RadioManager {
             case CMD_LAUNCH: // 0x26
                 Log.i(TAG, "Launch response: status=" + statusStr);
                 logMessage("Launch ACK: " + statusStr);
+                lastLaunchStatus = status;
+                if (launchLatch != null) launchLatch.countDown();
                 break;
 
             case CMD_VERSION: // 0x34
@@ -518,6 +522,8 @@ public class RadioManager {
 
         sendSpeakerEnable(false);
         writeSysfs(SYSFS_PTT, true);
+        launchLatch = new CountDownLatch(1);
+        lastLaunchStatus = -1;
         sendLaunchCommand(1);
         startAudioTransmit();
     }
@@ -528,11 +534,28 @@ public class RadioManager {
         logMessage("PTT UP");
 
         stopAudioTransmit();
-        // Drop PTT line first, then send stop twice to ensure module exits TX
+        // Drop PTT line first, then send stop with retries to ensure module exits TX
         writeSysfs(SYSFS_PTT, false);
-        sendLaunchCommand(0);
-        try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-        sendLaunchCommand(0);
+        boolean stopped = false;
+        for (int i = 0; i < 3 && !stopped; i++) {
+            launchLatch = new CountDownLatch(1);
+            lastLaunchStatus = -1;
+            sendLaunchCommand(0);
+            try {
+                if (launchLatch.await(200, TimeUnit.MILLISECONDS) && lastLaunchStatus == STATUS_SUCCESS) {
+                    stopped = true;
+                    break;
+                }
+            } catch (InterruptedException ignored) {}
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        }
+        if (!stopped) {
+            logMessage("Launch stop did not ACK success; forcing idle");
+            // As a fallback, toggle transfer-interrupt off then on to reset state
+            sendTransferInterrupt(0);
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            sendTransferInterrupt(2);
+        }
         sendSpeakerEnable(true);
     }
 
