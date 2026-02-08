@@ -60,6 +60,7 @@ public class RadioManager {
     private int fd = -1;        // command serial fd (ttyS0)
     private SerialPortHelper audioSerial;
     private boolean powered = false;
+    private long lastFreqHz = -1;
 
     private SerialReadThread readThread;
     private AudioTransmitThread audioTransmitThread;
@@ -469,6 +470,7 @@ public class RadioManager {
                 }
 
                 powered = true;
+                lastFreqHz = freqHz;
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
 
@@ -555,6 +557,11 @@ public class RadioManager {
             sendTransferInterrupt(0);
             try { Thread.sleep(100); } catch (InterruptedException ignored) {}
             sendTransferInterrupt(2);
+            // As last resort, power-cycle to break stuck TX
+            if (powered) {
+                logMessage("Force power-cycle to clear TX latch; re-power manually");
+                powerOff();
+            }
         }
         sendSpeakerEnable(true);
     }
