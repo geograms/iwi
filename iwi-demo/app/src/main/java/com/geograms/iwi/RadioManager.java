@@ -35,8 +35,9 @@ public class RadioManager {
     private static final int BAUD_RATE = 57600;
     private static final int READ_BUF_SIZE = 64;
     private static final long ACK_TIMEOUT_MS = 2000;
-    private static final int INIT_MAX_RETRIES = 10;
-    private static final long INIT_RETRY_INTERVAL_MS = 500;
+    private static final int INIT_MAX_RETRIES = 5;
+    private static final long INIT_RETRY_INTERVAL_MS = 200;
+    private static final long INIT_FIRST_TIMEOUT_MS = 4000;
 
     // Audio serial port (ttyS1)
     private static final String AUDIO_SERIAL_PORT = "/dev/ttyS1";
@@ -182,35 +183,26 @@ public class RadioManager {
             AudioRecord recorder = null;
             try {
                 int sampleRate = 8000;
-                int bufSize = AudioRecord.getMinBufferSize(sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-                if (bufSize < PCM_FRAME_SIZE) bufSize = PCM_FRAME_SIZE;
 
                 recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
                     sampleRate, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT, bufSize);
+                    AudioFormat.ENCODING_PCM_16BIT, PCM_FRAME_SIZE);
                 recorder.startRecording();
                 Log.i(TAG, "AudioTransmitThread started, reading mic → ttyS1 (raw)");
                 logMessage("Audio TX: mic → ttyS1 (raw PCM)");
 
                 byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
                 int frameCount = 0;
-                long nextSendAt = SystemClock.elapsedRealtime();
+                long lastSendTime = SystemClock.uptimeMillis();
 
                 while (running && !isInterrupted()) {
                     int read = recorder.read(pcmBuf, 0, PCM_FRAME_SIZE);
                     if (read == PCM_FRAME_SIZE && audioSerial != null) {
+                        // Busy-wait: ensure minimum 10ms between sends (stock app pacing)
+                        while (SystemClock.uptimeMillis() - lastSendTime < 10) { }
+                        lastSendTime = SystemClock.uptimeMillis();
                         audioSerial.sendBytes(Arrays.copyOf(pcmBuf, PCM_FRAME_SIZE));
                         frameCount++;
-                        nextSendAt += 10;
-                        long delay = nextSendAt - SystemClock.elapsedRealtime();
-                        if (delay > 0) {
-                            try {
-                                Thread.sleep(delay);
-                            } catch (InterruptedException ignored) {}
-                        } else {
-                            nextSendAt = SystemClock.elapsedRealtime();
-                        }
                         if (frameCount % 100 == 0) {
                             Log.d(TAG, "Audio TX: " + frameCount + " frames sent");
                         }
@@ -501,24 +493,25 @@ public class RadioManager {
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set all sysfs controls HIGH (required for module boot)
-                Thread.sleep(100);
+                // 6. Set all sysfs controls HIGH (required for module boot)
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
                 writeSysfs(SYSFS_PTT, true);
 
-                // 7. Wait for module to boot
-                Thread.sleep(500);
+                // 7. Brief wait before init check (boot time absorbed by latch timeout)
+                Thread.sleep(50);
 
-                // 8. Poll checkInitComplete until ACK (module boot time varies)
+                // 8. Send checkInitComplete: first attempt waits up to 2s (covers module boot),
+                //    retries use short 200ms window (response was likely lost)
                 boolean initOk = false;
                 for (int attempt = 1; attempt <= INIT_MAX_RETRIES; attempt++) {
                     initLatch = new CountDownLatch(1);
                     lastInitStatus = -1;
                     sendCheckInitComplete();
-                    logMessage("Init attempt " + attempt + "/" + INIT_MAX_RETRIES + "...");
+                    logMessage("Init check " + attempt + "/" + INIT_MAX_RETRIES + "...");
 
-                    if (initLatch.await(INIT_RETRY_INTERVAL_MS, TimeUnit.MILLISECONDS)) {
+                    long timeout = (attempt == 1) ? INIT_FIRST_TIMEOUT_MS : INIT_RETRY_INTERVAL_MS;
+                    if (initLatch.await(timeout, TimeUnit.MILLISECONDS)) {
                         if (lastInitStatus == STATUS_SUCCESS) {
                             logMessage("Init OK on attempt " + attempt);
                             initOk = true;
@@ -750,7 +743,7 @@ public class RadioManager {
             } catch (InterruptedException ignored) {}
 
             try {
-                long nextSendAt = SystemClock.elapsedRealtime();
+                long lastSendTime = SystemClock.uptimeMillis();
                 for (int i = 0; i < count; i++) {
                     double phase1 = 0.0;
                     double phase2 = 0.0;
@@ -771,18 +764,11 @@ public class RadioManager {
                                 pcmFrame[z] = 0;
                             }
                         }
+                        // Busy-wait: ensure minimum 10ms between sends (stock app pacing)
+                        while (SystemClock.uptimeMillis() - lastSendTime < 10) { }
+                        lastSendTime = SystemClock.uptimeMillis();
                         audioSerial.sendBytes(Arrays.copyOf(pcmFrame, PCM_FRAME_SIZE));
                         frameCounter++;
-                        nextSendAt += 10;
-                        long delay = nextSendAt - SystemClock.elapsedRealtime();
-                        if (delay > 0) {
-                            try {
-                                Thread.sleep(delay);
-                            } catch (InterruptedException ignored) {}
-                        } else {
-                            // If we fell behind, resync timing to avoid drift
-                            nextSendAt = SystemClock.elapsedRealtime();
-                        }
                     }
 
                     // Gap (silence)
@@ -790,17 +776,11 @@ public class RadioManager {
                     int gapFrames = (gapSamples + (PCM_FRAME_SIZE / 2) - 1) / (PCM_FRAME_SIZE / 2);
                     Arrays.fill(pcmFrame, (byte) 0);
                     for (int g = 0; g < gapFrames; g++) {
+                        // Busy-wait for gap frames too
+                        while (SystemClock.uptimeMillis() - lastSendTime < 10) { }
+                        lastSendTime = SystemClock.uptimeMillis();
                         audioSerial.sendBytes(Arrays.copyOf(pcmFrame, PCM_FRAME_SIZE));
                         frameCounter++;
-                        nextSendAt += 10;
-                        long delay = nextSendAt - SystemClock.elapsedRealtime();
-                        if (delay > 0) {
-                            try {
-                                Thread.sleep(delay);
-                            } catch (InterruptedException ignored) {}
-                        } else {
-                            nextSendAt = SystemClock.elapsedRealtime();
-                        }
                     }
                     logMessage("Sent beep " + (i + 1) + "/" + count);
                     Log.d(TAG, "Tone " + (i + 1) + "/" + count + " sent");
