@@ -13,7 +13,11 @@ package com.geograms.iwi;
  * Designed for 8kHz/16-bit/mono PCM (the DMR module's native format).
  * At 8kHz sample rate, 1200 baud gives ~6.67 samples/bit.
  */
+import android.util.Log;
+
 public class AX25 {
+
+    private static final String TAG = "AX25";
 
     // --- Constants ---
     public static final int BAUD_RATE = 1200;
@@ -395,6 +399,11 @@ public class AX25 {
         private int bufWritePos = 0;
         private long totalSamples = 0;
 
+        // Debug counters
+        private int flagCount = 0;
+        private int crcFailCount = 0;
+        private int tooShortCount = 0;
+
         // Precomputed correlation coefficients
         private final double[] markSin = new double[CORR_WINDOW];
         private final double[] markCos = new double[CORR_WINDOW];
@@ -438,6 +447,20 @@ public class AX25 {
          * chunk size. Decoded frames are delivered via the callback.
          */
         public void addSamples(short[] pcm, int count) {
+            if (totalSamples == 0) {
+                Log.i(TAG, "Demod: first samples arriving, count=" + count);
+            }
+            // Log peak amplitude every 800 samples (~100ms) for diagnostics
+            if (totalSamples % 800 < count) {
+                int peak = 0;
+                for (int j = 0; j < count; j++) {
+                    int abs = Math.abs(pcm[j]);
+                    if (abs > peak) peak = abs;
+                }
+                Log.i(TAG, "Demod: samples=" + totalSamples + " peak=" + peak
+                    + " flags=" + flagCount + " crcFail=" + crcFailCount
+                    + " tooShort=" + tooShortCount);
+            }
             for (int i = 0; i < count; i++) {
                 // Store sample in circular buffer
                 sampleBuf[bufWritePos] = pcm[i] / 32768.0;
@@ -508,6 +531,11 @@ public class AX25 {
             } else {
                 if (onesCount == 6) {
                     // Flag detected (01111110)
+                    flagCount++;
+                    if (flagCount <= 5 || flagCount % 50 == 0) {
+                        Log.d(TAG, "Demod: HDLC flag #" + flagCount
+                            + " inFrame=" + inFrame + " frameLen=" + frameLen);
+                    }
                     if (inFrame && frameLen > 0) deliverFrame();
                     inFrame = true;
                     bitCount = 0;
@@ -538,9 +566,29 @@ public class AX25 {
         }
 
         private void deliverFrame() {
-            if (frameLen < 18) { resetFrame(); return; }
+            if (frameLen < 18) {
+                Log.d(TAG, "Demod: frame too short: " + frameLen + " bytes");
+                tooShortCount++;
+                resetFrame();
+                return;
+            }
             int crc = crcCcitt(frameBuffer, 0, frameLen);
-            if (crc != CRC_VALID_RESIDUE) { resetFrame(); return; }
+            Log.i(TAG, "Demod: candidate frame len=" + frameLen
+                + " crc=0x" + String.format("%04X", crc)
+                + " expect=0x" + String.format("%04X", CRC_VALID_RESIDUE));
+            if (crc != CRC_VALID_RESIDUE) {
+                // Log first bytes of failed frame for diagnostics
+                StringBuilder hex = new StringBuilder();
+                for (int i = 0; i < Math.min(frameLen, 20); i++) {
+                    if (i > 0) hex.append(' ');
+                    hex.append(String.format("%02X", frameBuffer[i] & 0xFF));
+                }
+                Log.w(TAG, "Demod: CRC FAIL, first bytes: " + hex);
+                crcFailCount++;
+                resetFrame();
+                return;
+            }
+            Log.i(TAG, "Demod: VALID FRAME len=" + frameLen);
             byte[] frame = new byte[frameLen - 2];
             System.arraycopy(frameBuffer, 0, frame, 0, frameLen - 2);
             callback.onFrame(frame);

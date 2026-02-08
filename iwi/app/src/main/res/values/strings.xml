@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">IWI Radio Demo</string>
+    <string name="app_name">IWI Radio</string>
     <string name="frequency_label">Frequency (MHz)</string>
     <string name="power_on">POWER ON</string>
     <string name="power_off">POWER OFF</string>
@@ -10,6 +10,9 @@
     <string name="status_starting">Status: Starting...</string>
     <string name="status_on">Status: Powered On</string>
     <string name="squelch_label">Squelch</string>
+    <string name="aprs_hint">APRS message</string>
+    <string name="send_aprs">SEND</string>
+    <string name="aprs_default_message">IWI Radio test 144.800MHz</string>
     <string-array name="squelch_levels">
         <item>0</item>
         <item>1</item>

@@ -17,9 +17,14 @@ import me.f1reking.serialportlib.listener.ISerialPortDataListener;
 import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Encapsulates all radio control: power, frequency, PTT.
@@ -94,8 +99,30 @@ public class RadioManager {
     private volatile CountDownLatch statusLatch;
     private volatile int waitForStatus = -1;
 
+    private volatile int volumeLevel = 8;
+
+    // TX queue
+    private static final int TX_QUEUE_CAPACITY = 50;
+    private static final long CHANNEL_CLEAR_MS = 500;    // silence before TX
+    private static final long CHANNEL_WAIT_TIMEOUT_MS = 30000;
+    private static final long DEFAULT_FREQ_HZ = 144_800_000;  // 144.8 MHz
+    private final AtomicLong txJobCounter = new AtomicLong(0);
+    private final LinkedBlockingQueue<TxJob> txQueue = new LinkedBlockingQueue<>(TX_QUEUE_CAPACITY);
+    private TxQueueThread txQueueThread;
+    volatile long lastRxAudioTime = 0;
+
+    // Log ring buffer (thread-safe)
+    private static final int LOG_RING_SIZE = 500;
+    private final String[] logRing = new String[LOG_RING_SIZE];
+    private int logRingHead = 0;
+    private int logRingCount = 0;
+
+    // Received APRS packets (thread-safe via synchronized)
+    private final List<ReceivedPacket> receivedPackets = new ArrayList<>();
+
     private LogCallback logCallback;
     private final AudioReceiver audioReceiver = new AudioReceiver();
+    private AX25.Demodulator aprsDemodulator;
 
     public RadioManager(Context context) {
     }
@@ -112,6 +139,366 @@ public class RadioManager {
 
     public void setLogCallback(LogCallback callback) {
         this.logCallback = callback;
+    }
+
+    // --- State getters (for API server) ---
+
+    public String getFirmwareVersion() { return firmwareVersion; }
+    public int getModuleStatus() { return lastModuleStatus; }
+    public long getFrequency() { return lastFreqHz; }
+    public int getSquelchLevel() { return squelchLevel; }
+    public int getVolumeLevel() { return volumeLevel; }
+
+    public String getModuleStatusText() {
+        switch (lastModuleStatus) {
+            case 0x01: return "idle";
+            case 0x02: return "rx_end";
+            case 0x03: return "tx";
+            case 0x04: return "transition";
+            default: return "unknown";
+        }
+    }
+
+    /** Get recent log entries (newest last). */
+    public List<String> getRecentLog(int maxLines) {
+        synchronized (logRing) {
+            int count = Math.min(maxLines, logRingCount);
+            List<String> result = new ArrayList<>(count);
+            int start = (logRingHead - logRingCount + LOG_RING_SIZE) % LOG_RING_SIZE;
+            int skip = logRingCount - count;
+            for (int i = 0; i < count; i++) {
+                result.add(logRing[(start + skip + i) % LOG_RING_SIZE]);
+            }
+            return result;
+        }
+    }
+
+    /** Received APRS packet with timestamp. */
+    public static class ReceivedPacket {
+        public final long time;
+        public final String raw;
+        public final APRS.APRSPacket parsed;
+
+        ReceivedPacket(long time, String raw, APRS.APRSPacket parsed) {
+            this.time = time;
+            this.raw = raw;
+            this.parsed = parsed;
+        }
+    }
+
+    /** Get received APRS packets, optionally filtered by time. */
+    public List<ReceivedPacket> getReceivedPackets(long sinceMs) {
+        synchronized (receivedPackets) {
+            if (sinceMs <= 0) return new ArrayList<>(receivedPackets);
+            List<ReceivedPacket> result = new ArrayList<>();
+            for (ReceivedPacket p : receivedPackets) {
+                if (p.time > sinceMs) result.add(p);
+            }
+            return result;
+        }
+    }
+
+    /** Set volume and send command if powered. */
+    public void setVolume(int level, Runnable onDone) {
+        if (level < 0) level = 0;
+        if (level > 15) level = 15;
+        volumeLevel = level;
+        if (powered && fd > 0) {
+            int lv = level;
+            new Thread(() -> {
+                volumeLatch = new CountDownLatch(1);
+                lastVolumeStatus = -1;
+                sendVolume(lv);
+                try {
+                    volumeLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException ignored) {}
+                if (onDone != null) onDone.run();
+            }, "VolumeThread").start();
+        } else {
+            if (onDone != null) onDone.run();
+        }
+    }
+
+    /** Change frequency while powered. */
+    public void setFrequency(long freqHz, PowerOnCallback callback) {
+        if (!powered || fd <= 0) {
+            callback.onResult(false, "Radio not powered");
+            return;
+        }
+        new Thread(() -> {
+            channelLatch = new CountDownLatch(1);
+            lastChannelStatus = -1;
+            setAnalogChannel(freqHz);
+            try {
+                if (!channelLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    callback.onResult(false, "Channel ACK timeout");
+                    return;
+                }
+                if (lastChannelStatus != STATUS_SUCCESS) {
+                    callback.onResult(false, "Channel set failed: " + statusToString((byte) lastChannelStatus));
+                    return;
+                }
+                lastFreqHz = freqHz;
+                callback.onResult(true, "Frequency set to " + freqHz + " Hz");
+            } catch (InterruptedException e) {
+                callback.onResult(false, "Interrupted");
+            }
+        }, "FreqThread").start();
+    }
+
+    // --- TX Queue ---
+
+    /** A pending APRS transmission job. */
+    public static class TxJob {
+        public final long id;
+        public final short[] pcm;
+        public final long targetFreqHz;  // 0 = use current frequency
+        public final long queuedAt;
+        volatile boolean completed;
+        volatile boolean success;
+        volatile String resultMessage;
+
+        TxJob(long id, short[] pcm, long targetFreqHz) {
+            this.id = id;
+            this.pcm = pcm;
+            this.targetFreqHz = targetFreqHz;
+            this.queuedAt = System.currentTimeMillis();
+        }
+    }
+
+    /**
+     * Enqueue a PCM transmission. Returns the job (queued) or null if queue full.
+     * The queue thread handles: auto power-on, frequency switch/restore,
+     * RX/TX collision avoidance, and the actual transmission.
+     */
+    public TxJob enqueueTx(short[] pcm, long targetFreqHz) {
+        TxJob job = new TxJob(txJobCounter.incrementAndGet(), pcm, targetFreqHz);
+        if (txQueue.offer(job)) {
+            logMessage("TX queued: job #" + job.id + " (" + txQueue.size() + " in queue)");
+            return job;
+        }
+        return null;
+    }
+
+    public int getTxQueueSize() {
+        return txQueue.size();
+    }
+
+    /** Start the TX queue worker thread. Call once after construction. */
+    public void startTxQueue() {
+        if (txQueueThread == null) {
+            txQueueThread = new TxQueueThread();
+            txQueueThread.start();
+        }
+    }
+
+    /** Stop the TX queue worker thread and release resources. */
+    public void shutdown() {
+        txQueue.clear();
+        if (txQueueThread != null) {
+            txQueueThread.stopRunning();
+            try { txQueueThread.join(2000); } catch (InterruptedException ignored) {}
+            txQueueThread = null;
+        }
+    }
+
+    /**
+     * Queue worker: processes TxJobs one at a time.
+     * Handles auto power-on, frequency switching, channel-clear wait, TX, and freq restore.
+     */
+    private class TxQueueThread extends Thread {
+        volatile boolean running = true;
+
+        TxQueueThread() {
+            super("TxQueueThread");
+            setDaemon(true);
+        }
+
+        void stopRunning() {
+            running = false;
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            Log.i(TAG, "TxQueueThread started");
+            logMessage("TX queue started");
+
+            while (running && !isInterrupted()) {
+                try {
+                    TxJob job = txQueue.poll(1, TimeUnit.SECONDS);
+                    if (job == null) continue;
+                    processJob(job);
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.e(TAG, "TxQueue error", e);
+                    logMessage("TxQueue error: " + e.getMessage());
+                }
+            }
+            Log.i(TAG, "TxQueueThread stopped");
+        }
+
+        private void processJob(TxJob job) {
+            logMessage("TX queue: processing job #" + job.id);
+
+            // 1. Ensure radio is powered
+            if (!powered) {
+                long freq = job.targetFreqHz > 0 ? job.targetFreqHz : DEFAULT_FREQ_HZ;
+                logMessage("TX queue: auto power-on at " + (freq / 1_000_000.0) + " MHz");
+                CountDownLatch powerLatch = new CountDownLatch(1);
+                final boolean[] powerOk = {false};
+                final String[] powerMsg = {""};
+                powerOn(freq, (success, message) -> {
+                    powerOk[0] = success;
+                    powerMsg[0] = message;
+                    powerLatch.countDown();
+                });
+                try {
+                    if (!powerLatch.await(15000, TimeUnit.MILLISECONDS) || !powerOk[0]) {
+                        job.success = false;
+                        job.resultMessage = "Auto power-on failed: " + powerMsg[0];
+                        job.completed = true;
+                        logMessage("TX queue: " + job.resultMessage);
+                        return;
+                    }
+                } catch (InterruptedException e) { return; }
+            }
+
+            // 2. Switch frequency if needed
+            long originalFreqHz = lastFreqHz;
+            boolean freqChanged = false;
+            if (job.targetFreqHz > 0 && job.targetFreqHz != lastFreqHz) {
+                logMessage("TX queue: switching to " + (job.targetFreqHz / 1_000_000.0) + " MHz");
+                CountDownLatch freqLatch = new CountDownLatch(1);
+                final boolean[] freqOk = {false};
+                setFrequency(job.targetFreqHz, (success, message) -> {
+                    freqOk[0] = success;
+                    freqLatch.countDown();
+                });
+                try {
+                    if (!freqLatch.await(5000, TimeUnit.MILLISECONDS) || !freqOk[0]) {
+                        job.success = false;
+                        job.resultMessage = "Frequency switch failed";
+                        job.completed = true;
+                        logMessage("TX queue: " + job.resultMessage);
+                        return;
+                    }
+                    freqChanged = true;
+                } catch (InterruptedException e) { return; }
+            }
+
+            // 3. Wait for channel clear (no RX audio + module idle)
+            waitForChannelClear();
+
+            // 4. Transmit
+            transmitPcmSync(job.pcm);
+
+            // 5. Restore frequency if changed
+            if (freqChanged && originalFreqHz > 0) {
+                logMessage("TX queue: restoring " + (originalFreqHz / 1_000_000.0) + " MHz");
+                CountDownLatch restoreLatch = new CountDownLatch(1);
+                setFrequency(originalFreqHz, (success, message) -> restoreLatch.countDown());
+                try { restoreLatch.await(5000, TimeUnit.MILLISECONDS); }
+                catch (InterruptedException ignored) {}
+            }
+
+            job.success = true;
+            job.resultMessage = "Transmitted";
+            job.completed = true;
+            logMessage("TX queue: job #" + job.id + " complete");
+        }
+    }
+
+    /**
+     * Wait until channel is clear: no RX audio for CHANNEL_CLEAR_MS
+     * and module status is idle. Times out after CHANNEL_WAIT_TIMEOUT_MS.
+     */
+    private void waitForChannelClear() {
+        long sinceLastRx = SystemClock.uptimeMillis() - lastRxAudioTime;
+        boolean moduleIdle = isModuleIdle();
+        if (sinceLastRx > CHANNEL_CLEAR_MS && moduleIdle) {
+            return; // already clear
+        }
+
+        logMessage("TX queue: waiting for channel clear...");
+        long startWait = SystemClock.uptimeMillis();
+        while (SystemClock.uptimeMillis() - startWait < CHANNEL_WAIT_TIMEOUT_MS) {
+            try { Thread.sleep(200); } catch (InterruptedException e) { return; }
+            sinceLastRx = SystemClock.uptimeMillis() - lastRxAudioTime;
+            moduleIdle = isModuleIdle();
+            if (sinceLastRx > CHANNEL_CLEAR_MS && moduleIdle) {
+                logMessage("TX queue: channel clear after " +
+                    (SystemClock.uptimeMillis() - startWait) + "ms");
+                return;
+            }
+        }
+        logMessage("TX queue: channel wait timeout, transmitting anyway");
+    }
+
+    /** Module is idle for TX purposes: idle(1), rx_end(2), or unknown(-1). */
+    private boolean isModuleIdle() {
+        int s = lastModuleStatus;
+        return s == 0x01 || s == 0x02 || s == -1;
+    }
+
+    /**
+     * Synchronous PCM transmit (called from queue thread).
+     * Handles PTT toggle, status wait, frame pacing, cleanup.
+     */
+    private void transmitPcmSync(short[] pcm) {
+        if (!powered || audioSerial == null) {
+            logMessage("transmitPcmSync: not powered");
+            return;
+        }
+
+        logMessage("=== APRS TX (queued) ===");
+        statusLatch = new CountDownLatch(1);
+        waitForStatus = 0x03;
+        sendSpeakerEnable(false);
+        writeSysfs(SYSFS_PTT, false);
+        logMessage("PTT GPIO LOW (TX)");
+
+        try {
+            if (statusLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                logMessage("Module confirmed TX");
+            } else {
+                logMessage("TX status timeout, proceeding");
+            }
+        } catch (InterruptedException ignored) {}
+
+        try {
+            byte[] frame = new byte[PCM_FRAME_SIZE];
+            int sampleIdx = 0;
+            int frameCount = 0;
+            long lastSendTime = SystemClock.uptimeMillis();
+
+            while (sampleIdx < pcm.length) {
+                int samplesInFrame = Math.min(PCM_FRAME_SIZE / 2, pcm.length - sampleIdx);
+                for (int i = 0; i < samplesInFrame; i++) {
+                    int idx = i * 2;
+                    frame[idx] = (byte) (pcm[sampleIdx + i] & 0xFF);
+                    frame[idx + 1] = (byte) ((pcm[sampleIdx + i] >> 8) & 0xFF);
+                }
+                for (int z = samplesInFrame * 2; z < PCM_FRAME_SIZE; z++) {
+                    frame[z] = 0;
+                }
+                while (SystemClock.uptimeMillis() - lastSendTime < 10) { }
+                lastSendTime = SystemClock.uptimeMillis();
+                audioSerial.sendBytes(Arrays.copyOf(frame, PCM_FRAME_SIZE));
+                sampleIdx += samplesInFrame;
+                frameCount++;
+            }
+            logMessage("APRS TX: " + frameCount + " frames (" + pcm.length + " samples)");
+        } catch (Exception e) {
+            Log.e(TAG, "APRS TX error", e);
+            logMessage("APRS TX error: " + e.getMessage());
+        } finally {
+            writeSysfs(SYSFS_PTT, true);
+            logMessage("PTT GPIO HIGH (idle)");
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+            sendSpeakerEnable(true);
+        }
     }
 
     // --- Serial Read Thread (ttyS0 command responses) ---
@@ -229,9 +616,10 @@ public class RadioManager {
         }
     }
 
-    // --- Audio Receive (ttyS1) ---
+    // --- Audio Receive (ttyS1) — speaker + APRS demodulator in parallel ---
     private class AudioReceiver {
         private final byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
+        private final short[] sampleBuf = new short[PCM_FRAME_SIZE / 2]; // 80 samples
         private final ByteArrayOutputStream rxBuffer = new ByteArrayOutputStream();
         private AudioTrack track;
         private int rxFrameCount = 0;
@@ -290,18 +678,33 @@ public class RadioManager {
                             break;
                         }
                         if ((buf[start + 1] & 0xFF) == 0x00 && (buf[start + 166] & 0xFF) == 0x44) {
+                            System.arraycopy(buf, start + 6, pcmBuf, 0, PCM_FRAME_SIZE);
+
+                            // Play through speaker
                             startIfNeeded();
                             if (track != null) {
-                                System.arraycopy(buf, start + 6, pcmBuf, 0, PCM_FRAME_SIZE);
                                 track.write(pcmBuf, 0, PCM_FRAME_SIZE);
-                                rxFrameCount++;
-                                if (rxFrameCount == 1) {
-                                    Log.i(TAG, "RX audio: first frame received");
-                                    logMessage("RX audio: first frame received");
-                                } else if (rxFrameCount % 50 == 0) {
-                                    Log.d(TAG, "RX audio: " + rxFrameCount + " frames played");
-                                    logMessage("RX audio: " + rxFrameCount + " frames");
+                            }
+
+                            // Feed APRS demodulator in parallel
+                            if (aprsDemodulator != null) {
+                                for (int s = 0; s < 80; s++) {
+                                    sampleBuf[s] = (short) ((pcmBuf[s * 2] & 0xFF) |
+                                                            (pcmBuf[s * 2 + 1] << 8));
                                 }
+                                aprsDemodulator.addSamples(sampleBuf, 80);
+                            }
+
+                            lastRxAudioTime = SystemClock.uptimeMillis();
+                            rxFrameCount++;
+                            if (rxFrameCount == 1) {
+                                Log.i(TAG, "RX audio: first frame received");
+                                logMessage("RX audio: first frame received");
+                            } else if (rxFrameCount % 10 == 0) {
+                                Log.i(TAG, "RX audio: " + rxFrameCount + " frames played");
+                            }
+                            if (rxFrameCount % 50 == 0) {
+                                logMessage("RX audio: " + rxFrameCount + " frames");
                             }
                             idx = start + 167;
                         } else {
@@ -594,6 +997,7 @@ public class RadioManager {
 
                 volumeLatch = new CountDownLatch(1);
                 lastVolumeStatus = -1;
+                volumeLevel = 8;
                 sendVolume(8);
                 if (!volumeLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                     logMessage("Volume ACK timeout (continuing)");
@@ -612,6 +1016,31 @@ public class RadioManager {
                 }
 
                 // PTT GPIO is HIGH from boot = idle/RX mode (stock app never calls launchCommand here)
+
+                aprsDemodulator = APRS.createDemodulator(packet -> {
+                    Log.i(TAG, "APRS RX: " + packet.toString());
+                    logMessage("APRS: " + packet.toString());
+                    synchronized (receivedPackets) {
+                        receivedPackets.add(new ReceivedPacket(
+                            System.currentTimeMillis(), packet.toString(), packet));
+                    }
+                });
+
+                // Self-test: feed a synthetic APRS packet to verify demodulator pipeline
+                {
+                    byte[] testFrame = APRS.buildStatusPacket("TEST", 7, "loopback");
+                    short[] testPcm = AX25.modulateFrame(testFrame);
+                    Log.i(TAG, "Demod self-test: feeding " + testPcm.length + " samples");
+                    logMessage("Demod self-test: " + testPcm.length + " samples");
+                    int offset = 0;
+                    while (offset < testPcm.length) {
+                        int chunk = Math.min(80, testPcm.length - offset);
+                        short[] buf = new short[chunk];
+                        System.arraycopy(testPcm, offset, buf, 0, chunk);
+                        aprsDemodulator.addSamples(buf, chunk);
+                        offset += chunk;
+                    }
+                }
 
                 powered = true;
                 rxEnabled = true;
@@ -633,6 +1062,10 @@ public class RadioManager {
     public void powerOff() {
         Log.i(TAG, "Power off...");
         logMessage("=== Power Off ===");
+
+        int dropped = txQueue.size();
+        txQueue.clear();
+        if (dropped > 0) logMessage("TX queue: dropped " + dropped + " pending jobs");
 
         rxEnabled = false;
         stopAudioTransmit();
@@ -803,6 +1236,71 @@ public class RadioManager {
                 if (onComplete != null) onComplete.run();
             }
         }, "ToneBeepThread").start();
+    }
+
+    /**
+     * Transmit pre-generated PCM audio (e.g. APRS AFSK) over the air.
+     * Handles PTT, status wait, frame pacing, and cleanup.
+     */
+    public void sendPcmFrames(short[] pcm, Runnable onComplete) {
+        new Thread(() -> {
+            if (!powered || audioSerial == null) {
+                logMessage("Cannot send PCM: radio not powered");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+
+            logMessage("=== APRS TX ===");
+            // Toggle PTT GPIO LOW to enter TX mode
+            statusLatch = new CountDownLatch(1);
+            waitForStatus = 0x03;
+            sendSpeakerEnable(false);
+            writeSysfs(SYSFS_PTT, false);
+            logMessage("PTT GPIO LOW (TX for APRS)");
+            try {
+                if (statusLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Module confirmed TX for APRS");
+                } else {
+                    logMessage("TX status timeout for APRS, proceeding anyway");
+                }
+            } catch (InterruptedException ignored) {}
+
+            try {
+                byte[] frame = new byte[PCM_FRAME_SIZE];
+                int sampleIdx = 0;
+                int frameCount = 0;
+                long lastSendTime = SystemClock.uptimeMillis();
+
+                while (sampleIdx < pcm.length) {
+                    int samplesInFrame = Math.min(PCM_FRAME_SIZE / 2, pcm.length - sampleIdx);
+                    for (int i = 0; i < samplesInFrame; i++) {
+                        int idx = i * 2;
+                        frame[idx] = (byte) (pcm[sampleIdx + i] & 0xFF);
+                        frame[idx + 1] = (byte) ((pcm[sampleIdx + i] >> 8) & 0xFF);
+                    }
+                    // Zero-fill if last frame is short
+                    for (int z = samplesInFrame * 2; z < PCM_FRAME_SIZE; z++) {
+                        frame[z] = 0;
+                    }
+                    // Busy-wait pacing
+                    while (SystemClock.uptimeMillis() - lastSendTime < 10) { }
+                    lastSendTime = SystemClock.uptimeMillis();
+                    audioSerial.sendBytes(Arrays.copyOf(frame, PCM_FRAME_SIZE));
+                    sampleIdx += samplesInFrame;
+                    frameCount++;
+                }
+                logMessage("APRS TX: " + frameCount + " frames sent (" + pcm.length + " samples)");
+            } catch (Exception e) {
+                Log.e(TAG, "APRS TX error", e);
+                logMessage("APRS TX error: " + e.getMessage());
+            } finally {
+                writeSysfs(SYSFS_PTT, true);
+                logMessage("PTT GPIO HIGH (idle after APRS)");
+                try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+                sendSpeakerEnable(true);
+                if (onComplete != null) onComplete.run();
+            }
+        }, "AprsTxThread").start();
     }
 
     private void startAudioTransmit() {
@@ -998,6 +1496,12 @@ public class RadioManager {
     }
 
     private void logMessage(String msg) {
+        // Store in ring buffer
+        synchronized (logRing) {
+            logRing[logRingHead] = msg;
+            logRingHead = (logRingHead + 1) % LOG_RING_SIZE;
+            if (logRingCount < LOG_RING_SIZE) logRingCount++;
+        }
         if (logCallback != null) {
             logCallback.onLog(msg);
         }

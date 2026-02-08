@@ -26,10 +26,10 @@ root/boot_b_backup.img
 root/init_boot_a.img
 
 # Android build outputs
-iwi-demo/.gradle/
-iwi-demo/build/
-iwi-demo/app/build/
-iwi-demo/local.properties
+iwi/.gradle/
+iwi/build/
+iwi/app/build/
+iwi/local.properties
 
 # IDE
 .idea/

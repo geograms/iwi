@@ -55,6 +55,14 @@ echo ""
 echo "=== Launching on $DEVICE ($MODEL) ==="
 "$ADB" -s "$DEVICE" shell am start -n com.geograms.iwi/.MainActivity
 
+# Set up API port forward if not already active
+if ! "$ADB" -s "$DEVICE" forward --list 2>/dev/null | grep -q "tcp:6789"; then
+    echo ""
+    echo "=== Setting up API tunnel (localhost:6789) ==="
+    "$ADB" -s "$DEVICE" forward tcp:6789 tcp:6789
+    echo "API available at http://localhost:6789/"
+fi
+
 echo ""
 echo "=== Logcat (RadioManager + SerialPort) — Ctrl+C to stop ==="
 echo ""

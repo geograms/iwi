@@ -35,7 +35,7 @@ byte[] data = { (byte)(on ? '1' : '0'), '\n' };
 fos.write(data);
 fos.close();
 ```
-Used by: `iwi-demo/…/RadioManager.java`
+Used by: `iwi/…/RadioManager.java`
 
 ## Serial Read Thread Pattern
 Continuously read 64-byte chunks from serial port, parse responses:
@@ -48,7 +48,7 @@ if (bytesRead > 0) {
     handleResponse(data);
 }
 ```
-Used by: `iwi-demo/…/RadioManager.java` (inner class `SerialReadThread`)
+Used by: `iwi/…/RadioManager.java` (inner class `SerialReadThread`)
 
 ## Response ACK Pattern (CountDownLatch)
 Wait for module ACK before proceeding to next command:
@@ -79,7 +79,7 @@ Reusable JNI wrapper for `libwonder_serialport.so`:
 // Load: System.loadLibrary("wonder_serialport");
 // Methods: open(port, baudrate), close(fd), readData(fd, buf), writeData(fd, buf)
 ```
-See: `iwi-demo/…/SerialPort.java`
+See: `iwi/…/SerialPort.java`
 
 ## mtkclient raw offset read/write
 
@@ -126,7 +126,7 @@ fastboot reboot
 ## APRS / AX.25 Patterns
 
 Self-contained APRS over Bell 202 AFSK, optimized for 8kHz/16-bit/mono PCM.
-See: `iwi-demo/…/AX25.java`, `iwi-demo/…/APRS.java`
+See: `iwi/…/AX25.java`, `iwi/…/APRS.java`
 
 ### CRC-CCITT (AX.25)
 Bit-by-bit CRC with polynomial 0x8408 (reflected), init 0xFFFF, final XOR 0xFFFF:
@@ -198,7 +198,72 @@ boolean[] nrzi = AX25.nrziEncode(hdlc); // 0=toggle, 1=no change
 | Serial library | `./apk_extract/sources/com/wonder/serial/` |
 | SerialPortLib | `./apk_extract/sources/me/f1reking/serialportlib/` |
 | Native .so files | Inside APK at `lib/<arch>/` |
-| IWI Demo app | `./iwi-demo/` |
-| AX.25 layer | `./iwi-demo/app/src/main/java/com/geograms/iwi/AX25.java` |
-| APRS layer | `./iwi-demo/app/src/main/java/com/geograms/iwi/APRS.java` |
-| Demo APK output | `./iwi-demo/app/build/outputs/apk/debug/app-debug.apk` |
+| IWI Demo app | `./iwi/` |
+| AX.25 layer | `./iwi/app/src/main/java/com/geograms/iwi/AX25.java` |
+| APRS layer | `./iwi/app/src/main/java/com/geograms/iwi/APRS.java` |
+| API server | `./iwi/app/src/main/java/com/geograms/iwi/ApiServer.java` |
+| WAV reader | `./iwi/app/src/main/java/com/geograms/iwi/WavReader.java` |
+| API docs | `./docs/API.md` |
+| Demo APK output | `./iwi/app/build/outputs/apk/debug/app-debug.apk` |
+
+## HTTP API Server Pattern
+
+Embedded HTTP API using NanoHTTPD for remote control:
+```java
+// Dependency: implementation("org.nanohttpd:nanohttpd:2.3.1")
+// Extend NanoHTTPD, override serve(), route by URI + method
+ApiServer server = new ApiServer(radioManager, 6789);
+server.start();
+// ... later:
+server.stop();
+```
+
+### Blocking async operations for HTTP responses
+Use CountDownLatch to block HTTP handler until async callback fires:
+```java
+CountDownLatch latch = new CountDownLatch(1);
+radio.powerOn(freqHz, (success, message) -> {
+    // store result
+    latch.countDown();
+});
+latch.await(10000, TimeUnit.MILLISECONDS);
+// return response
+```
+Used by: `ApiServer.java` for power on, frequency change, tone, volume
+
+### TX Queue with Collision Avoidance
+Single-threaded queue worker for serialized APRS transmissions with auto power-on,
+frequency management, and RX/TX collision detection:
+```java
+// Enqueue (non-blocking, returns immediately)
+RadioManager.TxJob job = radio.enqueueTx(pcm, targetFreqHz); // null if full
+
+// Queue worker handles:
+// 1. Auto power-on if radio is off
+// 2. Frequency switch (and restore after TX)
+// 3. Channel-clear wait (500ms silence + module idle)
+// 4. PTT toggle, PCM frame pacing, PTT release
+```
+Capacity: 50 jobs. RX detection via `lastRxAudioTime` timestamp from AudioReceiver.
+Used by: `RadioManager.TxQueueThread` + `ApiServer` APRS and WAV endpoints
+
+### WAV File Parsing & Resampling
+Decode PCM WAV files to 8kHz mono 16-bit for radio TX:
+```java
+WavReader.Result result = WavReader.decode(wavBytes);
+short[] pcm = result.pcm;  // 8kHz mono 16-bit
+int durationMs = result.getDurationMs();
+```
+Handles: stereo→mono downmix, 8-bit→16-bit, arbitrary sample rate→8kHz (linear interpolation).
+Used by: `ApiServer` `/radio/wav` endpoint
+
+### Log Ring Buffer
+Thread-safe ring buffer for recent log entries:
+```java
+private static final int LOG_RING_SIZE = 500;
+private final String[] logRing = new String[LOG_RING_SIZE];
+private int logRingHead = 0, logRingCount = 0;
+// Write: synchronized (logRing) { logRing[head] = msg; head = (head+1)%SIZE; ... }
+// Read: synchronized (logRing) { ... iterate from oldest to newest ... }
+```
+Used by: `RadioManager.logMessage()` + `RadioManager.getRecentLog()`

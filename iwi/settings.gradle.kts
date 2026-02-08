@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "iwi-demo"
+rootProject.name = "iwi"
 include(":app")
