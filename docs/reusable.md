@@ -25,44 +25,9 @@ JVM_OPTS="-Xmx1g" /home/brito/dev/jadx/bin/jadx -d ./apk_extract ./QuickChat.apk
 
 ## Serial Protocol Patterns
 
-### Command frame builder pattern
-All serial commands follow the same frame structure — reusable for building new commands:
-```
-Header: 0x68
-CMD ID: 1 byte
-Fixed:  0x01 0x01
-CRC:    2 bytes (computed by CRC.checkSumBytes)
-Length: 2 bytes (payload length, big-endian)
-Data:   N bytes
-Footer: 0x10
-```
+See [transceiver.md](transceiver.md) for full serial protocol documentation (frame format, command table, frequency encoding, CRC, status codes, GPIO control, audio path, TX/RX transitions, and resolved issues).
 
-### Frequency encoding
-Frequencies are encoded as 4-byte little-endian integers (Hz):
-```java
-bArr[offset]     = (byte) (freq & 0xFF);
-bArr[offset + 1] = (byte) ((freq >> 8) & 0xFF);
-bArr[offset + 2] = (byte) ((freq >> 16) & 0xFF);
-bArr[offset + 3] = (byte) ((freq >> 24) & 0xFF);
-```
-
-### DMR ID encoding
-DMR IDs (local ID, contact ID) use the same 4-byte little-endian pattern as frequencies.
-
-### CRC utilities
-Two CRC functions available in `com.wonder.dmr.utils.CRC`:
-- `CRC.checkSumBytes(byte[] data, int len)` — frame checksum
-- `CRC.calculateCRC16XMODEM(byte[] data)` — CRC16-XMODEM for firmware update packets
-
-### Response status codes
-```
-0 = SUCCESS
-1 = FAIL
-2 = CHECKSUM_ERROR
--1 = ERROR (serial not ready)
-```
-
-## Sysfs Control Pattern
+### Sysfs Control Pattern
 Write ASCII '1' or '0' + newline via FileOutputStream:
 ```java
 FileOutputStream fos = new FileOutputStream(path);
@@ -97,16 +62,6 @@ if (!latch.await(2000, TimeUnit.MILLISECONDS)) {
 ```
 Used by: `RadioManager.powerOn()` for init (CMD 0x27) and channel (CMD 0x23) ACKs.
 
-## Response Parsing Pattern
-Response format: `[header, cmd, ?, status, CRC_hi, CRC_lo, len_hi, len_lo, ...payload..., footer]`
-```java
-byte cmdId = data[1];    // command ID echo
-byte status = data[3];   // 0=SUCCESS, 1=FAIL, 2=CRC_ERROR
-int payloadLen = ((data[6] & 0xFF) << 8) | (data[7] & 0xFF);
-byte[] payload = Arrays.copyOfRange(data, 8, 8 + payloadLen);
-```
-Used by: `RadioManager.handleResponse()`
-
 ## LogCallback Pattern
 Pass log messages from background threads to UI:
 ```java
@@ -115,23 +70,8 @@ public interface LogCallback { void onLog(String message); }
 ```
 Used by: `RadioManager` → `MainActivity`
 
-## Power On/Off Sequence
-1. Write `0` to all sysfs (power, pwd, ptt)
-2. Wait 200ms
-3. Open serial `/dev/ttyS0` at 57600
-4. Start serial read thread
-5. Wait 100ms, write `1` to all sysfs
-6. Wait 500ms for module boot
-7. Send `checkInitComplete` (CMD 0x27) → wait for ACK (up to 2s)
-8. Send `getVersion` (CMD 0x34) — informational
-9. Send `setAnalogCmd` (CMD 0x23) with frequency → wait for ACK (up to 2s)
-10. `AudioManager.setParameters("pdt_play=on")`
-
-Power off: pdt_play=off, pdt_mic=off, stop read thread, sysfs all to 0, close serial.
-
-## PTT Sequence
-**Press**: sysfs ptt=1 → pdt_mic=on → launchCommand(1) (CMD 0x26)
-**Release**: launchCommand(0) → pdt_mic=off → sysfs ptt=0 → pdt_play=on
+## Power On/Off & PTT Sequences
+See [transceiver.md](transceiver.md) — sections "Power-On Sequence", "Power-Off Sequence", and "TX/RX Transitions".
 
 ## SerialPort JNI Wrapper
 Reusable JNI wrapper for `libwonder_serialport.so`:
@@ -183,6 +123,69 @@ fastboot -w
 fastboot reboot
 ```
 
+## APRS / AX.25 Patterns
+
+Self-contained APRS over Bell 202 AFSK, optimized for 8kHz/16-bit/mono PCM.
+See: `iwi-demo/…/AX25.java`, `iwi-demo/…/APRS.java`
+
+### CRC-CCITT (AX.25)
+Bit-by-bit CRC with polynomial 0x8408 (reflected), init 0xFFFF, final XOR 0xFFFF:
+```java
+int crc = AX25.crcCcitt(data, 0, data.length);
+// Append as little-endian: low byte first, high byte second
+// Residue after including FCS in CRC: 0x0F47 (0xF0B8 ^ 0xFFFF)
+```
+Reusable for any CRC-CCITT application (X.25, HDLC, PPP).
+
+### AFSK Modulation (Bell 202)
+Generate 1200-baud AFSK audio (mark=1200Hz, space=2200Hz) from a boolean tone sequence:
+```java
+short[] pcm = AX25.modulateAfsk(tones); // true=mark, false=space
+// Continuous-phase sine, fractional sample accumulator for non-integer samples/bit
+```
+Works at 8kHz (~6.67 samples/bit). Reusable for any Bell 202 application.
+
+### AFSK Demodulation
+Streaming correlation-based demodulator with PLL bit clock recovery:
+```java
+AX25.Demodulator demod = new AX25.Demodulator(frame -> {
+    AX25.ParsedFrame pf = AX25.parseFrame(frame);
+    // process decoded frame
+});
+demod.addSamples(pcmChunk, count); // feed any chunk size
+```
+
+### APRS Coordinate Encoding
+Convert decimal degrees to APRS format:
+```java
+String lat = APRS.encodeLatitude(38.0266);   // "3801.60N"
+String lon = APRS.encodeLongitude(-122.1247); // "12207.48W"
+double lat2 = APRS.parseLatitude("3801.60N"); // 38.0267
+```
+
+### APRS Packet Building (one-liner TX)
+```java
+// Position packet → PCM audio, ready to send over serial
+short[] pcm = APRS.modulatePositionPacket("N0CALL", 7, lat, lon, '/', '[', "comment");
+// Message packet
+short[] pcm = APRS.modulateMessagePacket("N0CALL", 7, "W1AW", "Hello!", "001");
+```
+
+### APRS RX (streaming)
+```java
+AX25.Demodulator demod = APRS.createDemodulator(packet -> {
+    // packet.srcCall, packet.lat, packet.lon, packet.message, etc.
+});
+demod.addSamples(pcm, count); // feed from AudioReceiver
+```
+
+### HDLC Framing
+Reusable HDLC encode (bit stuffing + flags) and NRZI encode:
+```java
+boolean[] hdlc = AX25.hdlcEncode(frameWithCrc, preambleFlags, trailerFlags);
+boolean[] nrzi = AX25.nrziEncode(hdlc); // 0=toggle, 1=no change
+```
+
 ## File Locations
 
 | Item | Path |
@@ -196,4 +199,6 @@ fastboot reboot
 | SerialPortLib | `./apk_extract/sources/me/f1reking/serialportlib/` |
 | Native .so files | Inside APK at `lib/<arch>/` |
 | IWI Demo app | `./iwi-demo/` |
+| AX.25 layer | `./iwi-demo/app/src/main/java/com/geograms/iwi/AX25.java` |
+| APRS layer | `./iwi-demo/app/src/main/java/com/geograms/iwi/APRS.java` |
 | Demo APK output | `./iwi-demo/app/build/outputs/apk/debug/app-debug.apk` |
