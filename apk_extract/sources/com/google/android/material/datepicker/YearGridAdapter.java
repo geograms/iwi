@@ -1,0 +1,80 @@
+package com.google.android.material.datepicker;
+
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+import androidx.recyclerview.widget.v0;
+import androidx.recyclerview.widget.z1;
+import com.google.android.material.R;
+import com.google.android.material.datepicker.MaterialCalendar;
+import com.google.android.material.timepicker.TimeModel;
+import java.util.Calendar;
+import java.util.Iterator;
+import java.util.Locale;
+
+/* loaded from: classes.dex */
+class YearGridAdapter extends v0 {
+    private final MaterialCalendar<?> materialCalendar;
+
+    public static class ViewHolder extends z1 {
+        final TextView textView;
+
+        public ViewHolder(TextView textView) {
+            super(textView);
+            this.textView = textView;
+        }
+    }
+
+    public YearGridAdapter(MaterialCalendar<?> materialCalendar) {
+        this.materialCalendar = materialCalendar;
+    }
+
+    private View.OnClickListener createYearClickListener(final int i2) {
+        return new View.OnClickListener() { // from class: com.google.android.material.datepicker.YearGridAdapter.1
+            @Override // android.view.View.OnClickListener
+            public void onClick(View view) {
+                YearGridAdapter.this.materialCalendar.setCurrentMonth(YearGridAdapter.this.materialCalendar.getCalendarConstraints().clamp(Month.create(i2, YearGridAdapter.this.materialCalendar.getCurrentMonth().month)));
+                YearGridAdapter.this.materialCalendar.setSelector(MaterialCalendar.CalendarSelector.DAY);
+            }
+        };
+    }
+
+    @Override // androidx.recyclerview.widget.v0
+    public int getItemCount() {
+        return this.materialCalendar.getCalendarConstraints().getYearSpan();
+    }
+
+    public int getPositionForYear(int i2) {
+        return i2 - this.materialCalendar.getCalendarConstraints().getStart().year;
+    }
+
+    public int getYearForPosition(int i2) {
+        return this.materialCalendar.getCalendarConstraints().getStart().year + i2;
+    }
+
+    @Override // androidx.recyclerview.widget.v0
+    public void onBindViewHolder(ViewHolder viewHolder, int i2) {
+        int yearForPosition = getYearForPosition(i2);
+        viewHolder.textView.setText(String.format(Locale.getDefault(), TimeModel.NUMBER_FORMAT, Integer.valueOf(yearForPosition)));
+        TextView textView = viewHolder.textView;
+        textView.setContentDescription(DateStrings.getYearContentDescription(textView.getContext(), yearForPosition));
+        CalendarStyle calendarStyle = this.materialCalendar.getCalendarStyle();
+        Calendar todayCalendar = UtcDates.getTodayCalendar();
+        CalendarItemStyle calendarItemStyle = todayCalendar.get(1) == yearForPosition ? calendarStyle.todayYear : calendarStyle.year;
+        Iterator<Long> it = this.materialCalendar.getDateSelector().getSelectedDays().iterator();
+        while (it.hasNext()) {
+            todayCalendar.setTimeInMillis(it.next().longValue());
+            if (todayCalendar.get(1) == yearForPosition) {
+                calendarItemStyle = calendarStyle.selectedYear;
+            }
+        }
+        calendarItemStyle.styleItem(viewHolder.textView);
+        viewHolder.textView.setOnClickListener(createYearClickListener(yearForPosition));
+    }
+
+    @Override // androidx.recyclerview.widget.v0
+    public ViewHolder onCreateViewHolder(ViewGroup viewGroup, int i2) {
+        return new ViewHolder((TextView) LayoutInflater.from(viewGroup.getContext()).inflate(R.layout.mtrl_calendar_year, viewGroup, false));
+    }
+}

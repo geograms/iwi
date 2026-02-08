@@ -1,0 +1,28 @@
+# Large binary images (root experiments)
+root/*.img
+root/*.bin
+root/*.zip
+root/*.7z
+root/*.apk
+root/*.ko
+root/ksud
+root/magiskboot
+root/system.img
+
+# Android build outputs
+iwi-demo/.gradle/
+iwi-demo/build/
+iwi-demo/app/build/
+iwi-demo/local.properties
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude state
+.claude/
+.state
