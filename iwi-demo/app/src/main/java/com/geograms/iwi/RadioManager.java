@@ -329,6 +329,11 @@ public class RadioManager {
             return;
         }
 
+        if (data[0] != 0x68) {
+            Log.d(TAG, "Ignoring non-protocol data");
+            return;
+        }
+
         byte cmdId = data[1];
         byte status = data[3];
         String statusStr = statusToString(status);
