@@ -462,13 +462,11 @@ public class RadioManager {
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set sysfs power/pwd/PTT high (PTT will be lowered before init polling)
+                // 6. Wait 100ms then set sysfs power/pwd/PTT high (keep high through init; drop after init)
                 Thread.sleep(100);
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
                 writeSysfs(SYSFS_PTT, true);
-                Thread.sleep(100);
-                writeSysfs(SYSFS_PTT, false);
 
                 // 7. Wait for module to boot
                 Thread.sleep(500);
@@ -581,9 +579,9 @@ public class RadioManager {
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
 
-                // After init, default PTT line low
-                writeSysfs(SYSFS_PTT, false);
+                // After init, ensure idle then drop PTT line
                 sendLaunchCommand(0); // ensure idle
+                writeSysfs(SYSFS_PTT, false);
                 callback.onResult(true, "Radio powered on");
 
             } catch (Exception e) {
