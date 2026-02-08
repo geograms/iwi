@@ -357,11 +357,11 @@ public class RadioManager {
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set sysfs power/pwd high (keep PTT low until TX)
+                // 6. Wait 100ms then set sysfs power/pwd/PTT high (PTT will be lowered after init)
                 Thread.sleep(100);
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
-                writeSysfs(SYSFS_PTT, false);
+                writeSysfs(SYSFS_PTT, true);
 
                 // 7. Wait for module to boot
                 Thread.sleep(500);
