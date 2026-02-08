@@ -20,7 +20,6 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvLog;
     private ScrollView svLog;
     private boolean poweredOn = false;
-    private boolean automationStarted = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -69,50 +68,6 @@ public class MainActivity extends AppCompatActivity {
             return false;
         });
 
-        // Start the automated tone test shortly after launch.
-        svLog.postDelayed(this::startAutomation, 500);
-    }
-
-    /**
-     * Kick off an automated flow: power on, TX 10 beeps, power off, exit.
-     */
-    private void startAutomation() {
-        if (automationStarted) return;
-        automationStarted = true;
-
-        tvLog.append("Auto mode: starting...\n");
-        svLog.fullScroll(ScrollView.FOCUS_DOWN);
-
-        long freqHz = parseFrequencyHz();
-        if (freqHz <= 0) {
-            freqHz = 446_000_000L; // fallback default if parse fails
-            tvLog.append("Invalid frequency input, using default 446.000 MHz\n");
-        }
-
-        tvStatus.setText(R.string.status_starting);
-        btnPower.setEnabled(false);
-        btnPtt.setEnabled(false);
-
-        radio.powerOn(freqHz, (success, message) -> runOnUiThread(() -> {
-            if (!success) {
-                tvStatus.setText("Error: " + message);
-                tvLog.append("Auto mode aborted: " + message + "\n");
-                return;
-            }
-
-            poweredOn = true;
-            tvStatus.setText(R.string.status_on);
-            tvLog.append("Power on OK, sending test beeps...\n");
-
-            radio.sendToneBeepSequence(10, 200, 200, () -> {
-                runOnUiThread(() -> {
-                    tvLog.append("Test beeps done. Powering off and exiting...\n");
-                    radio.powerOff();
-                    poweredOn = false;
-                    finishAndRemoveTask();
-                });
-            });
-        }));
     }
 
     private void powerOn() {
