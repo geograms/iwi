@@ -90,6 +90,8 @@ public class RadioManager {
     private volatile String firmwareVersion = null;
     private volatile int lastModuleStatus = -1;
     private volatile boolean rxEnabled = false;
+    private volatile CountDownLatch statusLatch;
+    private volatile int waitForStatus = -1;
 
     private LogCallback logCallback;
     private final AudioReceiver audioReceiver = new AudioReceiver();
@@ -198,7 +200,7 @@ public class RadioManager {
                 while (running && !isInterrupted()) {
                     int read = recorder.read(pcmBuf, 0, PCM_FRAME_SIZE);
                     if (read == PCM_FRAME_SIZE && audioSerial != null) {
-                        audioSerial.sendBytes(pcmBuf);
+                        audioSerial.sendBytes(Arrays.copyOf(pcmBuf, PCM_FRAME_SIZE));
                         frameCount++;
                         nextSendAt += 10;
                         long delay = nextSendAt - SystemClock.elapsedRealtime();
@@ -405,6 +407,7 @@ public class RadioManager {
                     String desc;
                     switch (moduleStatus) {
                         case 0x01: desc = "Idle"; break;
+                        case 0x02: desc = "RX-end"; break;
                         case 0x03: desc = "TX"; break;
                         case 0x04: desc = "Transition"; break;
                         default: desc = "0x" + String.format("%02X", moduleStatus); break;
@@ -412,6 +415,10 @@ public class RadioManager {
                     Log.i(TAG, "Module status: " + desc);
                     logMessage("Status: " + desc);
                     lastModuleStatus = moduleStatus;
+                }
+                // Signal anyone waiting for a specific module status
+                if (moduleStatus == waitForStatus && statusLatch != null) {
+                    statusLatch.countDown();
                 }
                 break;
             }
@@ -606,15 +613,7 @@ public class RadioManager {
                     logMessage("Speaker set failed: " + statusToString((byte) lastSpkStatus));
                 }
 
-                // Transition module from TX to RX/idle mode (non-fatal)
-                launchLatch = new CountDownLatch(1);
-                lastLaunchStatus = -1;
-                sendLaunchCommand(0);
-                if (launchLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                    logMessage("Launch(0): " + statusToString((byte) lastLaunchStatus) + " (non-fatal)");
-                } else {
-                    logMessage("Launch(0) timeout (non-fatal)");
-                }
+                // PTT GPIO is HIGH from boot = idle/RX mode (stock app never calls launchCommand here)
 
                 powered = true;
                 rxEnabled = true;
@@ -670,11 +669,26 @@ public class RadioManager {
         logMessage("PTT DOWN");
 
         sendSpeakerEnable(false);
-        // PTT sysfs stays HIGH from power-on; TX/RX transitions use only serial commands
-        launchLatch = new CountDownLatch(1);
-        lastLaunchStatus = -1;
-        sendLaunchCommand(1);
-        startAudioTransmit();
+
+        // Set up wait for module status 3 (TX ready) BEFORE toggling GPIO
+        statusLatch = new CountDownLatch(1);
+        waitForStatus = 0x03;
+
+        // Toggle PTT GPIO LOW to enter TX mode (stock app behavior)
+        writeSysfs(SYSFS_PTT, false);
+        logMessage("PTT GPIO LOW (TX)");
+
+        // Wait for module to confirm TX mode before starting audio
+        new Thread(() -> {
+            try {
+                if (statusLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Module confirmed TX (status 3)");
+                } else {
+                    logMessage("TX status timeout, starting audio anyway");
+                }
+            } catch (InterruptedException ignored) {}
+            startAudioTransmit();
+        }, "TxStartThread").start();
     }
 
     public void stopTx() {
@@ -682,28 +696,17 @@ public class RadioManager {
         Log.i(TAG, "PTT release (TX stop)");
         logMessage("PTT UP");
 
-        stopAudioTransmit();
-        // PTT sysfs stays HIGH; use only serial commands for TX→RX transition
-        boolean stopped = false;
-        for (int i = 0; i < 3 && !stopped; i++) {
-            launchLatch = new CountDownLatch(1);
-            lastLaunchStatus = -1;
-            sendLaunchCommand(0);
-            try {
-                if (launchLatch.await(200, TimeUnit.MILLISECONDS) && lastLaunchStatus == STATUS_SUCCESS) {
-                    stopped = true;
-                    break;
-                }
-            } catch (InterruptedException ignored) {}
-            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-        }
-        if (!stopped) {
-            logMessage("Launch stop did not ACK success; forcing idle");
-            sendTransferInterrupt(0);
-            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-            sendTransferInterrupt(3);
-        }
-        sendSpeakerEnable(true);
+        // Toggle PTT GPIO HIGH to exit TX mode (stock app behavior)
+        writeSysfs(SYSFS_PTT, true);
+        logMessage("PTT GPIO HIGH (idle)");
+
+        // Delay 300ms then stop audio (matches stock app timing)
+        new Thread(() -> {
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+            stopAudioTransmit();
+            sendSpeakerEnable(true);
+            logMessage("Audio TX cleanup done");
+        }, "TxStopThread").start();
     }
 
     /**
@@ -733,9 +736,18 @@ public class RadioManager {
 
             logMessage("=== Auto TX: beeps x" + count + " ===");
             Log.i(TAG, "Tone sequence start: count=" + count + ", toneMs=" + toneMs + ", gapMs=" + gapMs);
-            // PTT sysfs stays HIGH; use only serial command to enter TX
-            sendLaunchCommand(1);
-            logMessage("Launch(1) for tones");
+            // Toggle PTT GPIO LOW to enter TX mode
+            statusLatch = new CountDownLatch(1);
+            waitForStatus = 0x03;
+            writeSysfs(SYSFS_PTT, false);
+            logMessage("PTT GPIO LOW (TX for tones)");
+            try {
+                if (statusLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Module confirmed TX for tones");
+                } else {
+                    logMessage("TX status timeout for tones, proceeding anyway");
+                }
+            } catch (InterruptedException ignored) {}
 
             try {
                 long nextSendAt = SystemClock.elapsedRealtime();
@@ -759,7 +771,7 @@ public class RadioManager {
                                 pcmFrame[z] = 0;
                             }
                         }
-                        audioSerial.sendBytes(pcmFrame);
+                        audioSerial.sendBytes(Arrays.copyOf(pcmFrame, PCM_FRAME_SIZE));
                         frameCounter++;
                         nextSendAt += 10;
                         long delay = nextSendAt - SystemClock.elapsedRealtime();
@@ -778,7 +790,7 @@ public class RadioManager {
                     int gapFrames = (gapSamples + (PCM_FRAME_SIZE / 2) - 1) / (PCM_FRAME_SIZE / 2);
                     Arrays.fill(pcmFrame, (byte) 0);
                     for (int g = 0; g < gapFrames; g++) {
-                        audioSerial.sendBytes(pcmFrame);
+                        audioSerial.sendBytes(Arrays.copyOf(pcmFrame, PCM_FRAME_SIZE));
                         frameCounter++;
                         nextSendAt += 10;
                         long delay = nextSendAt - SystemClock.elapsedRealtime();
@@ -798,8 +810,10 @@ public class RadioManager {
                 Log.e(TAG, "Tone sequence error", e);
                 logMessage("Tone error: " + e.getMessage());
             } finally {
-                sendLaunchCommand(0);
-                logMessage("Launch(0) after tones");
+                // Toggle PTT GPIO HIGH to exit TX mode
+                writeSysfs(SYSFS_PTT, true);
+                logMessage("PTT GPIO HIGH (idle after tones)");
+                try { Thread.sleep(300); } catch (InterruptedException ignored) {}
                 Log.i(TAG, "Tone sequence complete");
                 if (onComplete != null) onComplete.run();
             }
