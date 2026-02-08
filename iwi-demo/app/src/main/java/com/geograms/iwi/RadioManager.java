@@ -424,7 +424,18 @@ public class RadioManager {
                     return;
                 }
 
-                // 11. Set mic gain to mid (10) and volume to 8 (non-fatal)
+                // 11. Set transfer interrupt (mode 2 matches stock app) and wait for ACK (non-fatal)
+                transferLatch = new CountDownLatch(1);
+                lastTransferStatus = -1;
+                sendTransferInterrupt(2);
+                logMessage("Waiting for transfer-interrupt ACK...");
+                if (!transferLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Transfer-interrupt ACK timeout (continuing)");
+                } else if (lastTransferStatus != STATUS_SUCCESS) {
+                    logMessage("Transfer-interrupt set failed: " + statusToString((byte) lastTransferStatus) + " (continuing)");
+                }
+
+                // 12. Set mic gain to mid (10) and volume to 8 (non-fatal)
                 micLatch = new CountDownLatch(1);
                 lastMicStatus = -1;
                 sendMicGain(10);
@@ -456,6 +467,9 @@ public class RadioManager {
                 powered = true;
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
+
+                // After init, default PTT line low
+                writeSysfs(SYSFS_PTT, false);
                 callback.onResult(true, "Radio powered on");
 
             } catch (Exception e) {
@@ -514,8 +528,11 @@ public class RadioManager {
         logMessage("PTT UP");
 
         stopAudioTransmit();
-        sendLaunchCommand(0);
+        // Drop PTT line first, then send stop twice to ensure module exits TX
         writeSysfs(SYSFS_PTT, false);
+        sendLaunchCommand(0);
+        try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+        sendLaunchCommand(0);
         sendSpeakerEnable(true);
     }
 
