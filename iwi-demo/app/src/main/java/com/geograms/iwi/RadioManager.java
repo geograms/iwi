@@ -2,12 +2,13 @@ package com.geograms.iwi;
 
 import android.content.Context;
 import android.media.AudioFormat;
-import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.wonder.serial.SerialPort;
+import me.f1reking.serialportlib.SerialPortHelper;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -36,11 +37,6 @@ public class RadioManager {
     private static final String AUDIO_SERIAL_PORT = "/dev/ttyS1";
     private static final int AUDIO_BAUD_RATE = 230400;
     private static final int PCM_FRAME_SIZE = 160; // 80 samples * 2 bytes (16-bit mono 8kHz = 10ms)
-    // TX audio frame: BB 00 [4 header bytes] [160 PCM bytes] 44 = 167 bytes
-    private static final int TX_FRAME_SIZE = 167;
-    private static final byte TX_FRAME_START_1 = (byte) 0xBB;
-    private static final byte TX_FRAME_START_2 = (byte) 0x00;
-    private static final byte TX_FRAME_END = (byte) 0x44;
 
     private static final String SYSFS_POWER = "/sys/devices/platform/intercom/intercom_power_control";
     private static final String SYSFS_PWD = "/sys/devices/platform/intercom/intercom_pwd_control";
@@ -51,6 +47,8 @@ public class RadioManager {
     private static final byte CMD_LAUNCH = 0x26;
     private static final byte CMD_INIT = 0x27;
     private static final byte CMD_VERSION = 0x34;
+    private static final byte CMD_MIC_GAIN = 0x2A;
+    private static final byte CMD_VOLUME = 0x2E;
 
     // Response status codes
     private static final byte STATUS_SUCCESS = 0x00;
@@ -58,9 +56,8 @@ public class RadioManager {
     private static final byte STATUS_CRC_ERROR = 0x02;
 
     private final SerialPort serialPort = new SerialPort();
-    private final AudioManager audioManager;
     private int fd = -1;        // command serial fd (ttyS0)
-    private int audioFd = -1;   // audio serial fd (ttyS1)
+    private SerialPortHelper audioSerial;
     private boolean powered = false;
 
     private SerialReadThread readThread;
@@ -68,15 +65,20 @@ public class RadioManager {
     private volatile CountDownLatch initLatch;
     private volatile CountDownLatch versionLatch;
     private volatile CountDownLatch channelLatch;
+    private volatile CountDownLatch transferLatch;
+    private volatile CountDownLatch volumeLatch;
+    private volatile CountDownLatch micLatch;
     private volatile int lastInitStatus = -1;
     private volatile int lastVersionStatus = -1;
     private volatile int lastChannelStatus = -1;
+    private volatile int lastTransferStatus = -1;
+    private volatile int lastVolumeStatus = -1;
+    private volatile int lastMicStatus = -1;
     private volatile String firmwareVersion = null;
 
     private LogCallback logCallback;
 
     public RadioManager(Context context) {
-        audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
     }
 
     public boolean isPowered() {
@@ -164,27 +166,16 @@ public class RadioManager {
                     sampleRate, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufSize);
                 recorder.startRecording();
-                Log.i(TAG, "AudioTransmitThread started, reading mic → ttyS1 (framed)");
-                logMessage("Audio TX: mic → ttyS1 (framed)");
+                Log.i(TAG, "AudioTransmitThread started, reading mic → ttyS1 (raw)");
+                logMessage("Audio TX: mic → ttyS1 (raw PCM)");
 
                 byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
-                byte[] txFrame = new byte[TX_FRAME_SIZE];
-                // Pre-fill frame header and footer
-                txFrame[0] = TX_FRAME_START_1;  // 0xBB
-                txFrame[1] = TX_FRAME_START_2;  // 0x00
-                txFrame[2] = 0x00;  // header byte 3
-                txFrame[3] = 0x00;  // header byte 4
-                txFrame[4] = 0x00;  // header byte 5
-                txFrame[5] = 0x00;  // header byte 6
-                txFrame[TX_FRAME_SIZE - 1] = TX_FRAME_END;  // 0x44
                 int frameCount = 0;
 
                 while (running && !isInterrupted()) {
                     int read = recorder.read(pcmBuf, 0, PCM_FRAME_SIZE);
-                    if (read == PCM_FRAME_SIZE && audioFd > 0) {
-                        // Copy PCM data into frame at offset 6
-                        System.arraycopy(pcmBuf, 0, txFrame, 6, PCM_FRAME_SIZE);
-                        serialPort.writeData(audioFd, txFrame);
+                    if (read == PCM_FRAME_SIZE && audioSerial != null) {
+                        audioSerial.sendBytes(pcmBuf);
                         frameCount++;
                         if (frameCount % 100 == 0) {
                             Log.d(TAG, "Audio TX: " + frameCount + " frames sent");
@@ -259,6 +250,24 @@ public class RadioManager {
                 if (versionLatch != null) versionLatch.countDown();
                 break;
 
+            case CMD_MIC_GAIN: // 0x2A
+                Log.i(TAG, "MicGain response: status=" + statusStr);
+                lastMicStatus = status;
+                if (micLatch != null) micLatch.countDown();
+                break;
+
+            case CMD_VOLUME: // 0x2E
+                Log.i(TAG, "Volume response: status=" + statusStr);
+                lastVolumeStatus = status;
+                if (volumeLatch != null) volumeLatch.countDown();
+                break;
+
+            case 0x35: // setTransferInterrupt
+                Log.i(TAG, "TransferInterrupt response: status=" + statusStr);
+                lastTransferStatus = status;
+                if (transferLatch != null) transferLatch.countDown();
+                break;
+
             default:
                 Log.d(TAG, "Unknown command response: 0x" + String.format("%02X", cmdId));
                 logMessage("Unknown CMD: 0x" + String.format("%02X", cmdId));
@@ -301,23 +310,30 @@ public class RadioManager {
                 }
                 logMessage("ttyS0 opened fd=" + fd);
 
-                // 4. Open audio serial port (ttyS1)
-                audioFd = serialPort.open(AUDIO_SERIAL_PORT, AUDIO_BAUD_RATE);
-                if (audioFd <= 0) {
-                    Log.e(TAG, "Failed to open audio serial port, audioFd=" + audioFd);
-                    logMessage("ttyS1 open FAILED fd=" + audioFd);
-                    callback.onResult(false, "Audio serial port open failed (fd=" + audioFd + ")");
+        // 4. Open audio serial port (ttyS1) via libserialport
+                audioSerial = new SerialPortHelper();
+                audioSerial.setPort(AUDIO_SERIAL_PORT);
+                audioSerial.setBaudRate(AUDIO_BAUD_RATE);
+                audioSerial.setDataBits(8);
+                audioSerial.setStopBits(1);
+                audioSerial.setParity(0);
+                audioSerial.setFlowCon(0);
+                audioSerial.setFlags(0);
+                if (!audioSerial.open()) {
+                    Log.e(TAG, "Failed to open audio serial port (PCM)");
+                    logMessage("ttyS1 open FAILED (PCM)");
+                    callback.onResult(false, "Audio serial port open failed (PCM)");
                     serialPort.close(fd);
                     fd = -1;
-                    return;
-                }
-                logMessage("ttyS1 opened fd=" + audioFd);
+            return;
+        }
+        logMessage("ttyS1 (PCM) opened");
 
                 // 5. Start command read thread
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set sysfs to 1
+                // 6. Wait 100ms then set sysfs power/pwd/PTT high (PTT toggled again around TX)
                 Thread.sleep(100);
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
@@ -389,6 +405,25 @@ public class RadioManager {
                     return;
                 }
 
+                // 11. Set mic gain to mid (10) and volume to 8 (non-fatal)
+                micLatch = new CountDownLatch(1);
+                lastMicStatus = -1;
+                sendMicGain(10);
+                if (!micLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("MicGain ACK timeout (continuing)");
+                } else if (lastMicStatus != STATUS_SUCCESS) {
+                    logMessage("MicGain set failed: " + statusToString((byte) lastMicStatus));
+                }
+
+                volumeLatch = new CountDownLatch(1);
+                lastVolumeStatus = -1;
+                sendVolume(8);
+                if (!volumeLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Volume ACK timeout (continuing)");
+                } else if (lastVolumeStatus != STATUS_SUCCESS) {
+                    logMessage("Volume set failed: " + statusToString((byte) lastVolumeStatus));
+                }
+
                 powered = true;
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
@@ -415,9 +450,11 @@ public class RadioManager {
         writeSysfs(SYSFS_PWD, false);
         writeSysfs(SYSFS_PTT, false);
 
-        if (audioFd > 0) {
-            serialPort.close(audioFd);
-            audioFd = -1;
+        if (audioSerial != null) {
+            try {
+                audioSerial.close();
+            } catch (Exception ignored) {}
+            audioSerial = null;
         }
         if (fd > 0) {
             serialPort.close(fd);
@@ -436,6 +473,7 @@ public class RadioManager {
         Log.i(TAG, "PTT press (TX start)");
         logMessage("PTT DOWN");
 
+        writeSysfs(SYSFS_PTT, true);
         sendLaunchCommand(1);
         startAudioTransmit();
     }
@@ -447,10 +485,112 @@ public class RadioManager {
 
         stopAudioTransmit();
         sendLaunchCommand(0);
+        writeSysfs(SYSFS_PTT, false);
+    }
+
+    /**
+     * Send a sequence of synthesized DTMF-like beeps over ttyS1 without using the mic.
+     * The stock app pushes raw 160-byte PCM frames every ~10 ms with no extra framing.
+     * Useful for automated bench tests.
+     */
+    public void sendToneBeepSequence(int count, int toneMs, int gapMs, Runnable onComplete) {
+        new Thread(() -> {
+            if (!powered || audioSerial == null) {
+                logMessage("Cannot send tones: radio not powered");
+                Log.w(TAG, "Tone sequence aborted: not powered or audioSerial null");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+
+            // DTMF-ish pair (941 Hz + 1336 Hz)
+            final int sampleRate = 8000;
+            final double f1 = 941.0;
+            final double f2 = 1336.0;
+            final double step1 = 2.0 * Math.PI * f1 / sampleRate;
+            final double step2 = 2.0 * Math.PI * f2 / sampleRate;
+            final short amplitude = 20000;
+
+            byte[] pcmFrame = new byte[PCM_FRAME_SIZE];
+            int frameCounter = 0;
+
+            logMessage("=== Auto TX: beeps x" + count + " ===");
+            Log.i(TAG, "Tone sequence start: count=" + count + ", toneMs=" + toneMs + ", gapMs=" + gapMs);
+            writeSysfs(SYSFS_PTT, true);
+            sendLaunchCommand(1);
+            logMessage("PTT asserted for tones");
+
+            try {
+                long nextSendAt = SystemClock.elapsedRealtime();
+                for (int i = 0; i < count; i++) {
+                    double phase1 = 0.0;
+                    double phase2 = 0.0;
+                    int samples = (toneMs * sampleRate) / 1000;
+                    for (int s = 0; s < samples; s += (PCM_FRAME_SIZE / 2)) {
+                        int frameSamples = Math.min(PCM_FRAME_SIZE / 2, samples - s);
+                        for (int n = 0; n < frameSamples; n++) {
+                            short sample = (short) ((Math.sin(phase1) + Math.sin(phase2)) * amplitude * 0.5);
+                            int idx = n * 2;
+                            pcmFrame[idx] = (byte) (sample & 0xFF);
+                            pcmFrame[idx + 1] = (byte) ((sample >> 8) & 0xFF);
+                            phase1 += step1;
+                            phase2 += step2;
+                        }
+                        // If the last frame is shorter, zero-fill the remainder
+                        if (frameSamples * 2 < PCM_FRAME_SIZE) {
+                            for (int z = frameSamples * 2; z < PCM_FRAME_SIZE; z++) {
+                                pcmFrame[z] = 0;
+                            }
+                        }
+                        audioSerial.sendBytes(pcmFrame);
+                        frameCounter++;
+                        nextSendAt += 10;
+                        long delay = nextSendAt - SystemClock.elapsedRealtime();
+                        if (delay > 0) {
+                            try {
+                                Thread.sleep(delay);
+                            } catch (InterruptedException ignored) {}
+                        } else {
+                            // If we fell behind, resync timing to avoid drift
+                            nextSendAt = SystemClock.elapsedRealtime();
+                        }
+                    }
+
+                    // Gap (silence)
+                    int gapSamples = (gapMs * sampleRate) / 1000;
+                    int gapFrames = (gapSamples + (PCM_FRAME_SIZE / 2) - 1) / (PCM_FRAME_SIZE / 2);
+                    Arrays.fill(pcmFrame, (byte) 0);
+                    for (int g = 0; g < gapFrames; g++) {
+                        audioSerial.sendBytes(pcmFrame);
+                        frameCounter++;
+                        nextSendAt += 10;
+                        long delay = nextSendAt - SystemClock.elapsedRealtime();
+                        if (delay > 0) {
+                            try {
+                                Thread.sleep(delay);
+                            } catch (InterruptedException ignored) {}
+                        } else {
+                            nextSendAt = SystemClock.elapsedRealtime();
+                        }
+                    }
+                    logMessage("Sent beep " + (i + 1) + "/" + count);
+                    Log.d(TAG, "Tone " + (i + 1) + "/" + count + " sent");
+                }
+                Log.i(TAG, "Tone sequence frames sent: " + frameCounter);
+            } catch (Exception e) {
+                Log.e(TAG, "Tone sequence error", e);
+                logMessage("Tone error: " + e.getMessage());
+            } finally {
+                sendLaunchCommand(0);
+                writeSysfs(SYSFS_PTT, false);
+                logMessage("PTT released after tones");
+                Log.i(TAG, "Tone sequence complete, PTT released");
+                if (onComplete != null) onComplete.run();
+            }
+        }, "ToneBeepThread").start();
     }
 
     private void startAudioTransmit() {
-        if (audioFd <= 0) {
+        if (audioSerial == null) {
             Log.w(TAG, "Cannot start audio TX, ttyS1 not open");
             logMessage("WARN: ttyS1 not open for audio");
             return;
@@ -504,7 +644,7 @@ public class RadioManager {
         cmd[21] = 0x00;        // tx_type
         cmd[22] = 0x00;        // tx_subcode
         cmd[23] = 0x02;        // pwrsave: 2 (stock default)
-        cmd[24] = 0x00;        // volume: 0 (stock default in analog cmd)
+        cmd[24] = 0x08;        // volume: 8 (mid)
         cmd[25] = 0x02;        // monitor: 2 (stock default)
         cmd[26] = 0x02;        // relay: 2 (stock default)
         cmd[27] = 0x10;        // footer
@@ -541,6 +681,42 @@ public class RadioManager {
         sendCommand(cmd);
         Log.i(TAG, "Sent getVersion");
         logMessage("TX CMD 0x34 (version)");
+    }
+
+    // --- setTransferInterrupt (CMD 0x35) ---
+
+    private void sendTransferInterrupt(int mode) {
+        byte[] cmd = {0x68, 0x35, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, (byte) mode, 0x10};
+        byte[] crc = CRC.checkSumBytes(cmd, 10);
+        cmd[4] = crc[0];
+        cmd[5] = crc[1];
+        sendCommand(cmd);
+        Log.i(TAG, "Sent setTransferInterrupt mode=" + mode);
+        logMessage("TX CMD 0x35 transfer=" + mode);
+    }
+
+    // --- setMicGain (CMD 0x2A) ---
+
+    private void sendMicGain(int level) {
+        byte[] cmd = {0x68, CMD_MIC_GAIN, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, (byte) level, 0x10};
+        byte[] crc = CRC.checkSumBytes(cmd, 10);
+        cmd[4] = crc[0];
+        cmd[5] = crc[1];
+        sendCommand(cmd);
+        Log.i(TAG, "Sent setMicGain level=" + level);
+        logMessage("TX CMD 0x2A mic=" + level);
+    }
+
+    // --- setVolume (CMD 0x2E) ---
+
+    private void sendVolume(int level) {
+        byte[] cmd = {0x68, CMD_VOLUME, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, (byte) level, 0x10};
+        byte[] crc = CRC.checkSumBytes(cmd, 10);
+        cmd[4] = crc[0];
+        cmd[5] = crc[1];
+        sendCommand(cmd);
+        Log.i(TAG, "Sent setVolume level=" + level);
+        logMessage("TX CMD 0x2E volume=" + level);
     }
 
     // --- launchCommand (CMD 0x26) ---

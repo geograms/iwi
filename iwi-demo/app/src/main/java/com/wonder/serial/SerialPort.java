@@ -42,4 +42,8 @@ public class SerialPort {
     public int writeData(int fd, byte[] buf) {
         return native_writeData(fd, buf, buf.length);
     }
+
+    public int setup(int fd, int baudrate, int nbits, char parity, int stopbits) {
+        return native_setup(fd, baudrate, nbits, parity, stopbits);
+    }
 }

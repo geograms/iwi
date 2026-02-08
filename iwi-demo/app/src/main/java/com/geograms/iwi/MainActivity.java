@@ -1,7 +1,5 @@
 package com.geograms.iwi;
 
-import android.Manifest;
-import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.view.MotionEvent;
 import android.widget.Button;
@@ -10,7 +8,6 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 public class MainActivity extends AppCompatActivity {
@@ -23,6 +20,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvLog;
     private ScrollView svLog;
     private boolean poweredOn = false;
+    private boolean automationStarted = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -37,8 +35,6 @@ public class MainActivity extends AppCompatActivity {
         tvStatus = findViewById(R.id.tvStatus);
         tvLog = findViewById(R.id.tvLog);
         svLog = findViewById(R.id.svLog);
-
-        requestAudioPermission();
 
         radio.setLogCallback(msg -> runOnUiThread(() -> {
             tvLog.append(msg + "\n");
@@ -72,6 +68,51 @@ public class MainActivity extends AppCompatActivity {
             }
             return false;
         });
+
+        // Start the automated tone test shortly after launch.
+        svLog.postDelayed(this::startAutomation, 500);
+    }
+
+    /**
+     * Kick off an automated flow: power on, TX 10 beeps, power off, exit.
+     */
+    private void startAutomation() {
+        if (automationStarted) return;
+        automationStarted = true;
+
+        tvLog.append("Auto mode: starting...\n");
+        svLog.fullScroll(ScrollView.FOCUS_DOWN);
+
+        long freqHz = parseFrequencyHz();
+        if (freqHz <= 0) {
+            freqHz = 446_000_000L; // fallback default if parse fails
+            tvLog.append("Invalid frequency input, using default 446.000 MHz\n");
+        }
+
+        tvStatus.setText(R.string.status_starting);
+        btnPower.setEnabled(false);
+        btnPtt.setEnabled(false);
+
+        radio.powerOn(freqHz, (success, message) -> runOnUiThread(() -> {
+            if (!success) {
+                tvStatus.setText("Error: " + message);
+                tvLog.append("Auto mode aborted: " + message + "\n");
+                return;
+            }
+
+            poweredOn = true;
+            tvStatus.setText(R.string.status_on);
+            tvLog.append("Power on OK, sending test beeps...\n");
+
+            radio.sendToneBeepSequence(10, 200, 200, () -> {
+                runOnUiThread(() -> {
+                    tvLog.append("Test beeps done. Powering off and exiting...\n");
+                    radio.powerOff();
+                    poweredOn = false;
+                    finishAndRemoveTask();
+                });
+            });
+        }));
     }
 
     private void powerOn() {
@@ -117,14 +158,6 @@ public class MainActivity extends AppCompatActivity {
             return (long) (mhz * 1_000_000);
         } catch (NumberFormatException e) {
             return -1;
-        }
-    }
-
-    private void requestAudioPermission() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                new String[]{Manifest.permission.RECORD_AUDIO}, 1);
         }
     }
 
