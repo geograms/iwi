@@ -1,13 +1,22 @@
-# Large binary images (root experiments)
-root/*.img
-root/*.bin
-root/*.zip
-root/*.7z
-root/*.apk
-root/*.ko
+# Large downloadable files (use root/download.sh to fetch)
+root/Magisk.apk
+root/Magisk.zip
+root/KernelSU.apk
 root/ksud
 root/magiskboot
+root/kernelsu.ko
+root/gki_boot.img
+root/gki-6.1-boot_a.bin
+root/gki-6.6-boot_a.bin
+root/gki-boot-*.zip
+root/aosp_arm64_gsi.zip
 root/system.img
+root/LineageOS-22.2-VANILLA-EXT4-GSI.7z
+root/LineageOS-22.2-20260105-VANILLA-EXT4-GSI.img
+
+# Empty placeholder files (failed extractions)
+root/boot_b_backup.img
+root/init_boot_a.img
 
 # Android build outputs
 iwi-demo/.gradle/
