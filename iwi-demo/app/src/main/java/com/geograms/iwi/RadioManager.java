@@ -49,6 +49,7 @@ public class RadioManager {
     private static final byte CMD_VERSION = 0x34;
     private static final byte CMD_MIC_GAIN = 0x2A;
     private static final byte CMD_VOLUME = 0x2E;
+    private static final byte CMD_SPK_EN = 0x3C;
 
     // Response status codes
     private static final byte STATUS_SUCCESS = 0x00;
@@ -68,12 +69,14 @@ public class RadioManager {
     private volatile CountDownLatch transferLatch;
     private volatile CountDownLatch volumeLatch;
     private volatile CountDownLatch micLatch;
+    private volatile CountDownLatch spkLatch;
     private volatile int lastInitStatus = -1;
     private volatile int lastVersionStatus = -1;
     private volatile int lastChannelStatus = -1;
     private volatile int lastTransferStatus = -1;
     private volatile int lastVolumeStatus = -1;
     private volatile int lastMicStatus = -1;
+    private volatile int lastSpkStatus = -1;
     private volatile String firmwareVersion = null;
 
     private LogCallback logCallback;
@@ -171,12 +174,22 @@ public class RadioManager {
 
                 byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
                 int frameCount = 0;
+                long nextSendAt = SystemClock.elapsedRealtime();
 
                 while (running && !isInterrupted()) {
                     int read = recorder.read(pcmBuf, 0, PCM_FRAME_SIZE);
                     if (read == PCM_FRAME_SIZE && audioSerial != null) {
                         audioSerial.sendBytes(pcmBuf);
                         frameCount++;
+                        nextSendAt += 10;
+                        long delay = nextSendAt - SystemClock.elapsedRealtime();
+                        if (delay > 0) {
+                            try {
+                                Thread.sleep(delay);
+                            } catch (InterruptedException ignored) {}
+                        } else {
+                            nextSendAt = SystemClock.elapsedRealtime();
+                        }
                         if (frameCount % 100 == 0) {
                             Log.d(TAG, "Audio TX: " + frameCount + " frames sent");
                         }
@@ -260,6 +273,12 @@ public class RadioManager {
                 Log.i(TAG, "Volume response: status=" + statusStr);
                 lastVolumeStatus = status;
                 if (volumeLatch != null) volumeLatch.countDown();
+                break;
+
+            case CMD_SPK_EN: // 0x3C
+                Log.i(TAG, "Speaker response: status=" + statusStr);
+                lastSpkStatus = status;
+                if (spkLatch != null) spkLatch.countDown();
                 break;
 
             case 0x35: // setTransferInterrupt
@@ -424,6 +443,16 @@ public class RadioManager {
                     logMessage("Volume set failed: " + statusToString((byte) lastVolumeStatus));
                 }
 
+                // Ensure speaker is enabled for RX by default
+                spkLatch = new CountDownLatch(1);
+                lastSpkStatus = -1;
+                sendSpeakerEnable(true);
+                if (!spkLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Speaker ACK timeout (continuing)");
+                } else if (lastSpkStatus != STATUS_SUCCESS) {
+                    logMessage("Speaker set failed: " + statusToString((byte) lastSpkStatus));
+                }
+
                 powered = true;
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
@@ -473,6 +502,7 @@ public class RadioManager {
         Log.i(TAG, "PTT press (TX start)");
         logMessage("PTT DOWN");
 
+        sendSpeakerEnable(false);
         writeSysfs(SYSFS_PTT, true);
         sendLaunchCommand(1);
         startAudioTransmit();
@@ -486,6 +516,7 @@ public class RadioManager {
         stopAudioTransmit();
         sendLaunchCommand(0);
         writeSysfs(SYSFS_PTT, false);
+        sendSpeakerEnable(true);
     }
 
     /**
@@ -717,6 +748,18 @@ public class RadioManager {
         sendCommand(cmd);
         Log.i(TAG, "Sent setVolume level=" + level);
         logMessage("TX CMD 0x2E volume=" + level);
+    }
+
+    // --- setSpeakerEnable (CMD 0x3C) ---
+
+    private void sendSpeakerEnable(boolean enable) {
+        byte[] cmd = {0x68, CMD_SPK_EN, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, (byte) (enable ? 1 : 0), 0x10};
+        byte[] crc = CRC.checkSumBytes(cmd, 10);
+        cmd[4] = crc[0];
+        cmd[5] = crc[1];
+        sendCommand(cmd);
+        Log.i(TAG, "Sent setSpeakerEnable enable=" + enable);
+        logMessage("TX CMD 0x3C spk=" + (enable ? 1 : 0));
     }
 
     // --- launchCommand (CMD 0x26) ---
