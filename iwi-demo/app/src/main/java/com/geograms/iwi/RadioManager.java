@@ -357,11 +357,11 @@ public class RadioManager {
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set sysfs power/pwd/PTT high (PTT toggled again around TX)
+                // 6. Wait 100ms then set sysfs power/pwd high (keep PTT low until TX)
                 Thread.sleep(100);
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
-                writeSysfs(SYSFS_PTT, true);
+                writeSysfs(SYSFS_PTT, false);
 
                 // 7. Wait for module to boot
                 Thread.sleep(500);
@@ -557,11 +557,6 @@ public class RadioManager {
             sendTransferInterrupt(0);
             try { Thread.sleep(100); } catch (InterruptedException ignored) {}
             sendTransferInterrupt(2);
-            // As last resort, power-cycle to break stuck TX
-            if (powered) {
-                logMessage("Force power-cycle to clear TX latch; re-power manually");
-                powerOff();
-            }
         }
         sendSpeakerEnable(true);
     }
