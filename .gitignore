@@ -14,6 +14,13 @@ root/system.img
 root/LineageOS-22.2-VANILLA-EXT4-GSI.7z
 root/LineageOS-22.2-20260105-VANILLA-EXT4-GSI.img
 
+# Large extracted partition images
+root/vendor_a.img
+root/vendor_dlkm_a.img
+root/vendor_dlkm_bare.img
+root/vendor_dm4.img
+root/vendor_wifi/
+
 # Empty placeholder files (failed extractions)
 root/boot_b_backup.img
 root/init_boot_a.img

@@ -1,0 +1,159 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+buildscript {
+	repositories {
+		maven { url 'https://jitpack.io' }
+		mavenCentral()
+		mavenLocal()
+		google()
+	}
+	dependencies {
+		// NOTE: Do not place your application dependencies here; they belong
+		// in the individual module build.gradle files
+	}
+}
+
+plugins {
+	// obtain revision from git
+	id 'org.ajoberstar.grgit' version '5.3.2'
+	// https://github.com/Triple-T/gradle-play-publisher#usage
+	id("com.github.triplet.play") version "3.13.0"
+	alias(libs.plugins.androidApplication)
+	alias(libs.plugins.scalaAndroid)
+}
+
+allprojects {
+	repositories {
+		maven { url 'https://jitpack.io' }
+		mavenCentral()
+		mavenLocal()
+		google()
+	}
+}
+
+/////////////// APRSdroid specific build rules ///////////////
+scala.scalaVersion = "2.11.12"
+
+ext {
+	build_date = new Date().format('yyyy-MM-dd')
+	build_revision = grgit.describe(tags: true)
+	build_version = "APRSdroid ${build_revision} ${build_date}"
+}
+
+tasks.withType(ScalaCompile) {
+	// Suppress deprecation warnings
+	scalaCompileOptions.deprecation = false
+}
+
+def versionCodeDate() {
+	if (project.hasProperty("RELEASE_MINOR")) {
+		return new Date().format("yyyyMMdd" + RELEASE_MINOR).toInteger()
+	} else {
+		return new Date().format("yyyyMMdd00").toInteger()
+	}
+}
+
+def mapsApiKey() {
+	Properties properties = new Properties()
+	try {
+		properties.load(project.rootProject.file('local.properties').newDataInputStream())
+	} catch(Exception ex) {}
+	// the default google_maps_key is restricted to ge0rg's signing keys and can't be used by other builds!
+	properties.getProperty('mapsApiKey', "AIzaSyA12R_iI_upYQ33FWnPU_8GlMKrEmjDxiQ")
+}
+
+
+android {
+	namespace 'org.aprsdroid.app'
+	defaultConfig {
+		compileSdk = 35
+		minSdk = 14
+		targetSdk = 35
+		versionName "$build_revision"
+		versionCode versionCodeDate()
+		resValue "string", "build_revision", "$build_revision"
+		resValue "string", "build_date", "$build_date"
+		resValue "string", "build_version", "$build_version"
+
+		resValue "string", "google_maps_key", mapsApiKey()
+
+		testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+	}
+	useLibrary 'org.apache.http.legacy'
+	compileOptions {
+		sourceCompatibility JavaVersion.VERSION_17
+		targetCompatibility JavaVersion.VERSION_17
+	}
+
+	buildTypes {
+		debug {
+			minifyEnabled true
+			proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard.cfg'
+		}
+		release {
+			minifyEnabled true
+			proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard.cfg'
+		}
+	}
+
+	if (project.hasProperty("RELEASE_KEY_ALIAS")) {
+		signingConfigs {
+			release {
+				storeFile file(RELEASE_STORE_FILE)
+				storePassword RELEASE_STORE_PASSWORD
+				keyAlias RELEASE_KEY_ALIAS
+				keyPassword RELEASE_KEY_PASSWORD
+			}
+		}
+		buildTypes {
+			release {
+				signingConfig signingConfigs.release
+			}
+		}
+	}
+	sourceSets {
+		main {
+			manifest.srcFile 'AndroidManifest.xml'
+			java.srcDirs = ['src']
+			// some gradle-android-scala-plugin versions don't know scala.* properties
+			// if it breaks, just remove the following two lines:
+			//scala.srcDirs = ['src']
+			//scala.excludes = ["*.sw?"]
+			resources.srcDirs = ['src']
+			aidl.srcDirs = ['src']
+			renderscript.srcDirs = ['src']
+			res.srcDirs = ['res']
+			assets.srcDirs = ['assets']
+			jniLibs.srcDirs = ['libs']
+		}
+		androidTest {
+			java.srcDirs = ['androidTest/java']
+		}
+		test {
+			java.srcDirs = ['test/java']
+		}
+	}
+	lintOptions {
+		disable 'MissingTranslation'
+		disable 'InvalidPackage'
+	}
+}
+
+play {
+	serviceAccountCredentials = file('play-publish-credentials.json')
+	track = 'beta'
+}
+
+dependencies {
+	implementation(libs.scala.library)
+	implementation fileTree(include: ['*.jar'], dir: 'libs')
+	implementation 'com.google.android.gms:play-services-maps:17.0.0'
+	implementation 'com.google.maps.android:android-maps-utils:0.5'
+	implementation 'androidx.core:core:1.12.0'
+
+
+	implementation 'com.squareup.okio:okio:2.1.0'
+	androidTestImplementation 'com.android.support.test:runner:1.0.2'
+	androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
+	testImplementation 'junit:junit:4.12'
+}
+

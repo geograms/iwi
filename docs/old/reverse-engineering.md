@@ -294,10 +294,12 @@ The `DmrService` controls the radio module via Linux sysfs:
 ```
 /sys/devices/platform/intercom/intercom_power_control  — radio power on (1) / off (0)
 /sys/devices/platform/intercom/intercom_pwd_control     — password/enable control
-/sys/devices/platform/intercom/intercom_ptt_control     — push-to-talk on (1) / off (0)
+/sys/devices/platform/intercom/intercom_ptt_control     — TX/RX control: LOW (0) = TX, HIGH (1) = idle/RX
 ```
 
 These are written via a `Handler` on a background `HandlerThread` with a 10ms delay.
+
+**PTT GPIO behavior**: All three GPIOs must be HIGH for module boot. Power and PWD stay HIGH for the entire session. The PTT GPIO is toggled during transmissions: LOW to enter TX, HIGH to return to idle/RX. The stock app never uses `launchCommand` (CMD 0x26) for PTT.
 
 ### Audio routing
 
@@ -305,6 +307,19 @@ The app routes audio through Android's `AudioManager` with custom parameters:
 - `pdt_play=on` / `pdt_play=off` — enable/disable radio audio playback (speaker)
 - `pdt_mic=on` / `pdt_mic=off` — enable/disable microphone for radio TX
 - Stream volume is managed on `STREAM_MUSIC` (stream type 3)
+
+### TX Audio Pipeline (p0/h0.java, p0/r0.java, p0/o0.java)
+
+The stock app's audio TX path was fully reverse-engineered:
+
+1. PTT GPIO goes LOW → module enters TX (status `0x03`)
+2. `AudioRecord` opened with 8kHz/16-bit/mono, buffer size = 160 bytes exactly
+3. Read loop: `recorder.read(pcmBuf, 0, 160)` → blocks ~10ms
+4. **Busy-wait pacing**: `while (uptimeMillis() - lastSend < 10) {}` — NOT `Thread.sleep()`
+5. Send raw 160-byte PCM frame to ttyS1 via `SerialPortHelper.sendHex()`
+6. On PTT release: GPIO HIGH, wait 300ms, stop AudioRecord
+
+The busy-wait is critical — `Thread.sleep(10)` introduces 10–150% jitter that garbles the DMR vocoder output.
 
 ### Native libraries
 
@@ -346,3 +361,5 @@ The APK uses **ProGuard/R8 obfuscation**:
 3. **Embedded device**: This is designed for purpose-built Android intercom devices with kernel-level intercom drivers (`/sys/devices/platform/intercom/`)
 4. **WakeLock support**: Can keep the CPU awake when the screen is off for continuous radio operation
 5. **The app is a system app**: Installed at `/system/app/QuickChat/` indicating it ships pre-installed on these devices
+6. **Frame pacing is critical**: The DMR vocoder is extremely sensitive to TX frame timing. The stock app uses busy-wait spin loops (not `Thread.sleep()`) to achieve sub-millisecond 10ms cadence. This was the key to matching the stock app's audio quality.
+7. **PTT via GPIO, not serial command**: Despite having a `launchCommand` serial command (CMD 0x26), the stock app controls TX/RX exclusively via the PTT sysfs GPIO. This was initially misidentified as a "hardware enable".
