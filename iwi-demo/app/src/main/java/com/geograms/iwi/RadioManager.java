@@ -54,6 +54,7 @@ public class RadioManager {
     private static final byte CMD_VERSION = 0x34;
     private static final byte CMD_MIC_GAIN = 0x2A;
     private static final byte CMD_VOLUME = 0x2E;
+    private static final byte CMD_STATUS = 0x36;
     private static final byte CMD_SPK_EN = 0x3C;
 
     // Response status codes
@@ -87,6 +88,8 @@ public class RadioManager {
     private volatile int lastSpkStatus = -1;
     private volatile int squelchLevel = 5;
     private volatile String firmwareVersion = null;
+    private volatile int lastModuleStatus = -1;
+    private volatile boolean rxEnabled = false;
 
     private LogCallback logCallback;
     private final AudioReceiver audioReceiver = new AudioReceiver();
@@ -237,16 +240,17 @@ public class RadioManager {
         private final byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
         private final ByteArrayOutputStream rxBuffer = new ByteArrayOutputStream();
         private AudioTrack track;
+        private int rxFrameCount = 0;
 
         synchronized void startIfNeeded() {
             if (track != null) return;
             int minBuf = AudioTrack.getMinBufferSize(8000,
                 AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            int bufSize = Math.max(minBuf, PCM_FRAME_SIZE * 8);
+            int bufSize = Math.max(minBuf, 16384);
             track = new AudioTrack(
                 new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build(),
                 new AudioFormat.Builder()
                     .setSampleRate(8000)
@@ -270,6 +274,7 @@ public class RadioManager {
                 track = null;
             }
             rxBuffer.reset();
+            rxFrameCount = 0;
         }
 
         void handleIncoming(byte[] data) {
@@ -295,6 +300,14 @@ public class RadioManager {
                             if (track != null) {
                                 System.arraycopy(buf, start + 6, pcmBuf, 0, PCM_FRAME_SIZE);
                                 track.write(pcmBuf, 0, PCM_FRAME_SIZE);
+                                rxFrameCount++;
+                                if (rxFrameCount == 1) {
+                                    Log.i(TAG, "RX audio: first frame received");
+                                    logMessage("RX audio: first frame received");
+                                } else if (rxFrameCount % 50 == 0) {
+                                    Log.d(TAG, "RX audio: " + rxFrameCount + " frames played");
+                                    logMessage("RX audio: " + rxFrameCount + " frames");
+                                }
                             }
                             idx = start + 167;
                         } else {
@@ -386,6 +399,23 @@ public class RadioManager {
                 if (transferLatch != null) transferLatch.countDown();
                 break;
 
+            case CMD_STATUS: { // 0x36 status beacon
+                int moduleStatus = (data.length > 8) ? (data[8] & 0xFF) : -1;
+                if (moduleStatus != lastModuleStatus) {
+                    String desc;
+                    switch (moduleStatus) {
+                        case 0x01: desc = "Idle"; break;
+                        case 0x03: desc = "TX"; break;
+                        case 0x04: desc = "Transition"; break;
+                        default: desc = "0x" + String.format("%02X", moduleStatus); break;
+                    }
+                    Log.i(TAG, "Module status: " + desc);
+                    logMessage("Status: " + desc);
+                    lastModuleStatus = moduleStatus;
+                }
+                break;
+            }
+
             default:
                 Log.d(TAG, "Unknown command response: 0x" + String.format("%02X", cmdId));
                 logMessage("Unknown CMD: 0x" + String.format("%02X", cmdId));
@@ -440,7 +470,9 @@ public class RadioManager {
                 audioSerial.setISerialPortDataListener(new ISerialPortDataListener() {
                     @Override
                     public void onDataReceived(byte[] bytes) {
-                        audioReceiver.handleIncoming(bytes);
+                        if (rxEnabled) {
+                            audioReceiver.handleIncoming(bytes);
+                        }
                     }
 
                     @Override
@@ -462,7 +494,7 @@ public class RadioManager {
                 readThread = new SerialReadThread();
                 readThread.start();
 
-                // 6. Wait 100ms then set sysfs power/pwd/PTT high (keep high through init; drop after init)
+                // 6. Wait 100ms then set all sysfs controls HIGH (required for module boot)
                 Thread.sleep(100);
                 writeSysfs(SYSFS_POWER, true);
                 writeSysfs(SYSFS_PWD, true);
@@ -534,10 +566,10 @@ public class RadioManager {
                     return;
                 }
 
-                // 11. Set transfer interrupt (mode 2 matches stock app) and wait for ACK (non-fatal)
+                // 11. Set transfer interrupt (mode 3 matches stock app) and wait for ACK (non-fatal)
                 transferLatch = new CountDownLatch(1);
                 lastTransferStatus = -1;
-                sendTransferInterrupt(2);
+                sendTransferInterrupt(3);
                 logMessage("Waiting for transfer-interrupt ACK...");
                 if (!transferLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                     logMessage("Transfer-interrupt ACK timeout (continuing)");
@@ -574,14 +606,21 @@ public class RadioManager {
                     logMessage("Speaker set failed: " + statusToString((byte) lastSpkStatus));
                 }
 
+                // Transition module from TX to RX/idle mode (non-fatal)
+                launchLatch = new CountDownLatch(1);
+                lastLaunchStatus = -1;
+                sendLaunchCommand(0);
+                if (launchLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    logMessage("Launch(0): " + statusToString((byte) lastLaunchStatus) + " (non-fatal)");
+                } else {
+                    logMessage("Launch(0) timeout (non-fatal)");
+                }
+
                 powered = true;
+                rxEnabled = true;
                 lastFreqHz = freqHz;
                 Log.i(TAG, "Power on complete, freq=" + freqHz + " Hz");
                 logMessage("Power on OK, freq=" + freqHz + " Hz");
-
-                // After init, ensure idle then drop PTT line
-                sendLaunchCommand(0); // ensure idle
-                writeSysfs(SYSFS_PTT, false);
                 callback.onResult(true, "Radio powered on");
 
             } catch (Exception e) {
@@ -598,6 +637,7 @@ public class RadioManager {
         Log.i(TAG, "Power off...");
         logMessage("=== Power Off ===");
 
+        rxEnabled = false;
         stopAudioTransmit();
         stopReadThread();
         audioReceiver.stop();
@@ -630,7 +670,7 @@ public class RadioManager {
         logMessage("PTT DOWN");
 
         sendSpeakerEnable(false);
-        writeSysfs(SYSFS_PTT, true);
+        // PTT sysfs stays HIGH from power-on; TX/RX transitions use only serial commands
         launchLatch = new CountDownLatch(1);
         lastLaunchStatus = -1;
         sendLaunchCommand(1);
@@ -643,8 +683,7 @@ public class RadioManager {
         logMessage("PTT UP");
 
         stopAudioTransmit();
-        // Drop PTT line first, then send stop with retries to ensure module exits TX
-        writeSysfs(SYSFS_PTT, false);
+        // PTT sysfs stays HIGH; use only serial commands for TX→RX transition
         boolean stopped = false;
         for (int i = 0; i < 3 && !stopped; i++) {
             launchLatch = new CountDownLatch(1);
@@ -660,10 +699,9 @@ public class RadioManager {
         }
         if (!stopped) {
             logMessage("Launch stop did not ACK success; forcing idle");
-            // As a fallback, toggle transfer-interrupt off then on to reset state
             sendTransferInterrupt(0);
             try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-            sendTransferInterrupt(2);
+            sendTransferInterrupt(3);
         }
         sendSpeakerEnable(true);
     }
@@ -695,9 +733,9 @@ public class RadioManager {
 
             logMessage("=== Auto TX: beeps x" + count + " ===");
             Log.i(TAG, "Tone sequence start: count=" + count + ", toneMs=" + toneMs + ", gapMs=" + gapMs);
-            writeSysfs(SYSFS_PTT, true);
+            // PTT sysfs stays HIGH; use only serial command to enter TX
             sendLaunchCommand(1);
-            logMessage("PTT asserted for tones");
+            logMessage("Launch(1) for tones");
 
             try {
                 long nextSendAt = SystemClock.elapsedRealtime();
@@ -761,9 +799,8 @@ public class RadioManager {
                 logMessage("Tone error: " + e.getMessage());
             } finally {
                 sendLaunchCommand(0);
-                writeSysfs(SYSFS_PTT, false);
-                logMessage("PTT released after tones");
-                Log.i(TAG, "Tone sequence complete, PTT released");
+                logMessage("Launch(0) after tones");
+                Log.i(TAG, "Tone sequence complete");
                 if (onComplete != null) onComplete.run();
             }
         }, "ToneBeepThread").start();
