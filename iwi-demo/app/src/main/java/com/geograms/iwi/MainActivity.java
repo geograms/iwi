@@ -4,6 +4,8 @@ import android.os.Bundle;
 import android.view.MotionEvent;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ArrayAdapter;
+import android.widget.Spinner;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -19,6 +21,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvStatus;
     private TextView tvLog;
     private ScrollView svLog;
+    private Spinner spSquelch;
     private boolean poweredOn = false;
 
     @Override
@@ -34,6 +37,13 @@ public class MainActivity extends AppCompatActivity {
         tvStatus = findViewById(R.id.tvStatus);
         tvLog = findViewById(R.id.tvLog);
         svLog = findViewById(R.id.svLog);
+        spSquelch = findViewById(R.id.spSquelch);
+
+        ArrayAdapter<CharSequence> squelchAdapter = ArrayAdapter.createFromResource(
+            this, R.array.squelch_levels, android.R.layout.simple_spinner_item);
+        squelchAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spSquelch.setAdapter(squelchAdapter);
+        spSquelch.setSelection(5); // default squelch=5
 
         radio.setLogCallback(msg -> runOnUiThread(() -> {
             tvLog.append(msg + "\n");
@@ -76,6 +86,8 @@ public class MainActivity extends AppCompatActivity {
             tvStatus.setText("Invalid frequency");
             return;
         }
+        int squelch = getSquelchLevel();
+        radio.setSquelchLevel(squelch);
 
         btnPower.setEnabled(false);
         tvStatus.setText(R.string.status_starting);
@@ -113,6 +125,14 @@ public class MainActivity extends AppCompatActivity {
             return (long) (mhz * 1_000_000);
         } catch (NumberFormatException e) {
             return -1;
+        }
+    }
+
+    private int getSquelchLevel() {
+        try {
+            return Integer.parseInt(spSquelch.getSelectedItem().toString());
+        } catch (Exception e) {
+            return 5;
         }
     }
 

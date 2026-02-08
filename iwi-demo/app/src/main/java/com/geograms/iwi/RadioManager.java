@@ -1,15 +1,20 @@
 package com.geograms.iwi;
 
 import android.content.Context;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
+import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.os.SystemClock;
 import android.util.Log;
 
 import com.wonder.serial.SerialPort;
 import me.f1reking.serialportlib.SerialPortHelper;
+import me.f1reking.serialportlib.listener.ISerialPortDataListener;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
@@ -80,15 +85,23 @@ public class RadioManager {
     private volatile int lastVolumeStatus = -1;
     private volatile int lastMicStatus = -1;
     private volatile int lastSpkStatus = -1;
+    private volatile int squelchLevel = 5;
     private volatile String firmwareVersion = null;
 
     private LogCallback logCallback;
+    private final AudioReceiver audioReceiver = new AudioReceiver();
 
     public RadioManager(Context context) {
     }
 
     public boolean isPowered() {
         return powered;
+    }
+
+    public void setSquelchLevel(int level) {
+        if (level < 0) level = 0;
+        if (level > 9) level = 9;
+        squelchLevel = level;
     }
 
     public void setLogCallback(LogCallback callback) {
@@ -219,6 +232,87 @@ public class RadioManager {
         }
     }
 
+    // --- Audio Receive (ttyS1) ---
+    private class AudioReceiver {
+        private final byte[] pcmBuf = new byte[PCM_FRAME_SIZE];
+        private final ByteArrayOutputStream rxBuffer = new ByteArrayOutputStream();
+        private AudioTrack track;
+
+        synchronized void startIfNeeded() {
+            if (track != null) return;
+            int minBuf = AudioTrack.getMinBufferSize(8000,
+                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            int bufSize = Math.max(minBuf, PCM_FRAME_SIZE * 8);
+            track = new AudioTrack(
+                new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+                new AudioFormat.Builder()
+                    .setSampleRate(8000)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build(),
+                bufSize,
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE);
+            track.play();
+            Log.i(TAG, "AudioReceiver started");
+            logMessage("Audio RX: ttyS1 → speaker");
+        }
+
+        synchronized void stop() {
+            if (track != null) {
+                try {
+                    track.stop();
+                    track.release();
+                } catch (Exception ignored) {}
+                track = null;
+            }
+            rxBuffer.reset();
+        }
+
+        void handleIncoming(byte[] data) {
+            synchronized (this) {
+                try {
+                    rxBuffer.write(data);
+                    byte[] buf = rxBuffer.toByteArray();
+                    int idx = 0;
+                    while (idx < buf.length) {
+                        int start = -1;
+                        for (int i = idx; i < buf.length; i++) {
+                            if ((buf[i] & 0xFF) == 0xBB) {
+                                start = i;
+                                break;
+                            }
+                        }
+                        if (start == -1 || buf.length - start < 167) {
+                            // Not enough for a full frame yet
+                            break;
+                        }
+                        if ((buf[start + 1] & 0xFF) == 0x00 && (buf[start + 166] & 0xFF) == 0x44) {
+                            startIfNeeded();
+                            if (track != null) {
+                                System.arraycopy(buf, start + 6, pcmBuf, 0, PCM_FRAME_SIZE);
+                                track.write(pcmBuf, 0, PCM_FRAME_SIZE);
+                            }
+                            idx = start + 167;
+                        } else {
+                            idx = start + 1;
+                        }
+                    }
+                    // keep leftover
+                    byte[] remaining = Arrays.copyOfRange(buf, idx, buf.length);
+                    rxBuffer.reset();
+                    rxBuffer.write(remaining);
+                } catch (Exception e) {
+                    Log.e(TAG, "AudioReceiver error", e);
+                    rxBuffer.reset();
+                }
+            }
+        }
+    }
+
     // --- Response Handling ---
 
     private void handleResponse(byte[] data) {
@@ -343,6 +437,17 @@ public class RadioManager {
                 audioSerial.setParity(0);
                 audioSerial.setFlowCon(0);
                 audioSerial.setFlags(0);
+                audioSerial.setISerialPortDataListener(new ISerialPortDataListener() {
+                    @Override
+                    public void onDataReceived(byte[] bytes) {
+                        audioReceiver.handleIncoming(bytes);
+                    }
+
+                    @Override
+                    public void onDataSend(byte[] bytes) {
+                        // no-op
+                    }
+                });
                 if (!audioSerial.open()) {
                     Log.e(TAG, "Failed to open audio serial port (PCM)");
                     logMessage("ttyS1 open FAILED (PCM)");
@@ -494,6 +599,7 @@ public class RadioManager {
 
         stopAudioTransmit();
         stopReadThread();
+        audioReceiver.stop();
 
         writeSysfs(SYSFS_POWER, false);
         writeSysfs(SYSFS_PWD, false);
@@ -711,7 +817,7 @@ public class RadioManager {
 
         cmd[16] = 0x00;        // band: 0 = UHF
         cmd[17] = 0x01;        // power: 1 = high
-        cmd[18] = 0x05;        // squelch: 5 (stock default)
+        cmd[18] = (byte) squelchLevel;        // squelch level
         cmd[19] = 0x00;        // rx_type: 0 = no CTCSS/DCS
         cmd[20] = 0x00;        // rx_subcode
         cmd[21] = 0x00;        // tx_type

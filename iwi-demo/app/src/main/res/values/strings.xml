@@ -9,4 +9,17 @@
     <string name="status_off">Status: Powered Off</string>
     <string name="status_starting">Status: Starting...</string>
     <string name="status_on">Status: Powered On</string>
+    <string name="squelch_label">Squelch</string>
+    <string-array name="squelch_levels">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+        <item>5</item>
+        <item>6</item>
+        <item>7</item>
+        <item>8</item>
+        <item>9</item>
+    </string-array>
 </resources>
