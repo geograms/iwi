@@ -15,6 +15,9 @@ package com.geograms.iwi;
  */
 import android.util.Log;
 
+import java.io.FileOutputStream;
+import java.io.IOException;
+
 public class AX25 {
 
     private static final String TAG = "AX25";
@@ -28,11 +31,16 @@ public class AX25 {
     public static final int CONTROL_UI = 0x03;
     public static final int PID_NO_L3 = 0xF0;
     public static final int CRC_POLY = 0x8408;   // CRC-CCITT reflected
-    public static final int MARK_AMPLITUDE = 16000;
-    public static final int SPACE_AMPLITUDE = 28800; // 1.8x mark — compensates receiver de-emphasis
+    public static int txAmplitude = 16000; // adjustable for radio module tuning
     public static final int PREAMBLE_FLAGS = 40;  // ~267ms at 1200 baud
     public static final int TRAILER_FLAGS = 4;
     public static final int WARMUP_SAMPLES = 1600; // 200ms at 8kHz — TX warmup silence
+
+    // Per-tone amplitude scaling (adjustable via /aprs/config API for tuning).
+    // Default 1.0/1.0 — set to different values only if radio module frequency
+    // response needs compensation (measure with HackRF capture first).
+    public static double markAmplitudeScale = 1.0;
+    public static double spaceAmplitudeScale = 1.0;
 
     private static final double SAMPLES_PER_BIT = (double) SAMPLE_RATE / BAUD_RATE;
     private static final double TWO_PI = 2.0 * Math.PI;
@@ -211,11 +219,11 @@ public class AX25 {
 
     /**
      * NRZI encode: 0-bit = toggle, 1-bit = no change.
-     * Initial state is true (mark).
+     * Initial state is false (space) to match direwolf/standard convention.
      */
     public static boolean[] nrziEncode(boolean[] hdlcBits) {
         boolean[] tones = new boolean[hdlcBits.length];
-        boolean current = true; // start with mark
+        boolean current = false; // start with space (matches direwolf/standard convention)
         for (int i = 0; i < hdlcBits.length; i++) {
             if (!hdlcBits[i]) {
                 current = !current; // 0 = toggle
@@ -241,14 +249,17 @@ public class AX25 {
         int sampleIdx = WARMUP_SAMPLES;
 
         for (int bitIdx = 0; bitIdx < tones.length; bitIdx++) {
-            double freq = tones[bitIdx] ? MARK_FREQ : SPACE_FREQ;
+            boolean isMark = tones[bitIdx];
+            double freq = isMark ? MARK_FREQ : SPACE_FREQ;
             double phaseIncrement = TWO_PI * freq / SAMPLE_RATE;
-            int amplitude = tones[bitIdx] ? MARK_AMPLITUDE : SPACE_AMPLITUDE;
+            // Per-tone amplitude: compensates for module's frequency response
+            double amplitude = txAmplitude * (isMark ? markAmplitudeScale : spaceAmplitudeScale);
 
             // Number of samples for this bit (fractional accumulator)
             double bitEnd = WARMUP_SAMPLES + (bitIdx + 1) * SAMPLES_PER_BIT;
             while (sampleIdx < bitEnd && sampleIdx < pcm.length) {
-                pcm[sampleIdx] = (short) (amplitude * Math.sin(phase));
+                pcm[sampleIdx] = (short) Math.max(-32767, Math.min(32767,
+                    (int)(amplitude * Math.sin(phase))));
                 phase += phaseIncrement;
                 if (phase >= TWO_PI) phase -= TWO_PI;
                 sampleIdx++;
@@ -583,13 +594,13 @@ public class AX25 {
                 + " crc=0x" + String.format("%04X", crc)
                 + " expect=0x" + String.format("%04X", CRC_VALID_RESIDUE));
             if (crc != CRC_VALID_RESIDUE) {
-                // Log first bytes of failed frame for diagnostics
+                // Log ALL bytes of failed frame for diagnostics
                 StringBuilder hex = new StringBuilder();
-                for (int i = 0; i < Math.min(frameLen, 20); i++) {
+                for (int i = 0; i < frameLen; i++) {
                     if (i > 0) hex.append(' ');
                     hex.append(String.format("%02X", frameBuffer[i] & 0xFF));
                 }
-                Log.w(TAG, "Demod: CRC FAIL, first bytes: " + hex);
+                Log.w(TAG, "Demod: CRC FAIL, all bytes: " + hex);
                 crcFailCount++;
                 resetFrame();
                 return;
@@ -608,5 +619,57 @@ public class AX25 {
             frameLen = 0;
             onesCount = 0;
         }
+    }
+
+    // ========================================================================
+    // DIAGNOSTICS
+    // ========================================================================
+
+    /**
+     * Save PCM samples as a WAV file for offline testing with Direwolf/multimon-ng.
+     * Format: 8kHz, 16-bit, mono, little-endian PCM.
+     */
+    public static void savePcmAsWav(short[] pcm, String filePath) throws IOException {
+        int dataSize = pcm.length * 2;
+        byte[] header = new byte[44];
+        // RIFF header
+        header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+        writeLE32(header, 4, 36 + dataSize);
+        header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+        // fmt chunk
+        header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+        writeLE32(header, 16, 16);
+        writeLE16(header, 20, (short) 1);  // PCM format
+        writeLE16(header, 22, (short) 1);  // mono
+        writeLE32(header, 24, SAMPLE_RATE);
+        writeLE32(header, 28, SAMPLE_RATE * 2); // byte rate
+        writeLE16(header, 32, (short) 2);  // block align
+        writeLE16(header, 34, (short) 16); // bits per sample
+        // data chunk
+        header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+        writeLE32(header, 40, dataSize);
+
+        FileOutputStream fos = new FileOutputStream(filePath);
+        fos.write(header);
+        byte[] buf = new byte[dataSize];
+        for (int i = 0; i < pcm.length; i++) {
+            buf[i * 2] = (byte) (pcm[i] & 0xFF);
+            buf[i * 2 + 1] = (byte) ((pcm[i] >> 8) & 0xFF);
+        }
+        fos.write(buf);
+        fos.close();
+        Log.i(TAG, "Saved WAV: " + filePath + " (" + pcm.length + " samples)");
+    }
+
+    private static void writeLE16(byte[] buf, int offset, short value) {
+        buf[offset] = (byte) (value & 0xFF);
+        buf[offset + 1] = (byte) ((value >> 8) & 0xFF);
+    }
+
+    private static void writeLE32(byte[] buf, int offset, int value) {
+        buf[offset] = (byte) (value & 0xFF);
+        buf[offset + 1] = (byte) ((value >> 8) & 0xFF);
+        buf[offset + 2] = (byte) ((value >> 16) & 0xFF);
+        buf[offset + 3] = (byte) ((value >> 24) & 0xFF);
     }
 }
